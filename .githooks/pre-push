@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+root=$(git rev-parse --show-toplevel)
+# Scan every reachable snapshot, including outgoing intermediate commits and tags.
+exec /usr/bin/python3 "$root/scripts/guardrails.py" push
