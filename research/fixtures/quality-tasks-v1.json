@@ -1,0 +1,28 @@
+{
+  "version": "rosevine-quality-tasks-v1",
+  "license": "GPL-3.0-only",
+  "provenance": "Original synthetic Rosevine task definitions; no copied external tasks.",
+  "generator": "scripts/quality_tasks.py",
+  "calibration": {
+    "seed": 20261112,
+    "per_category": 4,
+    "tasks": 20,
+    "sha256": "2d15702933d6a08724e434a7414dee7625de2b03da8ba18feb8c87f3fe213b7e"
+  },
+  "holdout": {
+    "seed": 20261113,
+    "per_category": 20,
+    "tasks": 100,
+    "sha256": "31c6704a89aa50c16b07d003ac3443a2b2702887f0b205f7e5f45d25192c3df3"
+  },
+  "categories": [
+    "arithmetic",
+    "structured-transform",
+    "algorithm-trace",
+    "text-instructions",
+    "retrieval"
+  ],
+  "split_rule": "Distinct exact prompts/IDs; shared templates. Holdout must not be used for tolerance or candidate calibration.",
+  "scoring": "Strict JSON equality of visible response, including integer types; no markdown, duplicate keys or extra keys.",
+  "limitations": "Shared templates across disjoint prompts; no claim of unseen task-family or pretraining exclusion; not an NLL corpus."
+}

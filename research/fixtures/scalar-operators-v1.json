@@ -1,0 +1,48 @@
+{
+  "version": "rosevine-scalar-operators-v1",
+  "license": "GPL-3.0-only",
+  "provenance": "Original synthetic small-operator fixtures; no model tensors or personal prompts.",
+  "input_dtype": "FP32",
+  "independent_analysis": "binary64 mathematical reductions, not an FP32 rounding emulator",
+  "reference_source_revision": "cd959bae99ff4bed22bef2604f45241c09bbb8c8",
+  "criterion": "proposed protocol A: abs(error) <= 1e-5 + 1e-4 * abs(reference)",
+  "capture_requirement": "Mark saved intermediates as GGML outputs; graph expansion alone can permit fusion to skip an intermediate.",
+  "rms": {
+    "input": [1, -2, 3, -4],
+    "weights": [0.25, 0.5, 1, 2],
+    "epsilon": 0.000001,
+    "zero_input": [0, 0, 0, 0]
+  },
+  "gelu_tanh": {
+    "input": [-8, -4, -2, -1, -0.25, 0, 0.25, 1, 2, 4, 8, 16],
+    "native_cpu_observation": "Installed CPU GELU uses FP16 lookup semantics and fails the unchanged mathematical FP32 criterion on some fixtures; precision-specific review is pending."
+  },
+  "softmax": {
+    "input": [10000, 10001, 9999, -10000]
+  },
+  "gated_ffn": {
+    "input": [2, -1],
+    "up_matrix_rows": [[1, 0], [0, 1]],
+    "gate_matrix_rows": [[0, 1], [1, 0]],
+    "down_matrix_rows": [[3, 4]],
+    "activation": "tanh GELU on gate, multiplied by up",
+    "native_operations": ["GELU then MUL", "GEGLU_SPLIT"]
+  },
+  "attention": {
+    "query": [1],
+    "keys_definition": [[0], ["ln(3)"]],
+    "values": [[2], [6]],
+    "score_scale": 1,
+    "allowed": [true, true],
+    "expected_weights": [0.25, 0.75],
+    "expected_output": [5],
+    "masked_case": {
+      "keys": [[0], [1000]],
+      "values": [[2], [999]],
+      "allowed": [true, false],
+      "expected_weights": [1, 0],
+      "expected_output": [2]
+    }
+  },
+  "limitations": "Tiny CPU-only synthetic checks. No RoPE, KV cache, all-layer model, GPU or expert-placement equivalence claim; no tolerance exception approved."
+}

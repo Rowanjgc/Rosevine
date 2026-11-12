@@ -1,0 +1,66 @@
+{
+  "version": "rosevine-fidelity-corpus-v1",
+  "generator": "scripts/fidelity_corpus.py",
+  "sources": [
+    {
+      "file": "mbpp.jsonl",
+      "method": "GitHub connector fetch; original returned UTF-8 content saved without execution",
+      "url": "https://github.com/google-research/google-research/blob/f8d6d14a1fc6eaef606d7d1e1fa4e96ee09afb81/mbpp/mbpp.jsonl"
+    },
+    {
+      "file": "google-research-NOTICE.md",
+      "method": "GitHub connector fetch; original returned UTF-8 content saved without execution",
+      "url": "https://github.com/google-research/google-research/blob/f8d6d14a1fc6eaef606d7d1e1fa4e96ee09afb81/README.md"
+    },
+    {
+      "file": "mbpp-README.md",
+      "method": "GitHub connector fetch; original returned UTF-8 content saved without execution",
+      "url": "https://github.com/google-research/google-research/blob/f8d6d14a1fc6eaef606d7d1e1fa4e96ee09afb81/mbpp/README.md"
+    },
+    {
+      "file": "gsm-test.jsonl",
+      "method": "GitHub connector fetch; original returned UTF-8 content saved without execution",
+      "url": "https://github.com/openai/grade-school-math/blob/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data/test.jsonl"
+    },
+    {
+      "file": "gsm-LICENSE",
+      "method": "GitHub connector fetch; original returned UTF-8 content saved without execution",
+      "url": "https://github.com/openai/grade-school-math/blob/3101c7d5072418e28b9008a6636bde82a006892c/LICENSE"
+    }
+  ],
+  "source_revisions": {
+    "gsm8k": "3101c7d5072418e28b9008a6636bde82a006892c",
+    "mbpp": "f8d6d14a1fc6eaef606d7d1e1fa4e96ee09afb81"
+  },
+  "source_hashes": {
+    "google-research-NOTICE.md": "1022d37738b52c672304dbe71038a4a1f0d2cac5de3c9178652873a5698a8674",
+    "gsm-LICENSE": "86bbb73e855821d7c401912fd4bf82e34313e6e3b6fd6f909f2b6cc9e209a53b",
+    "gsm-test.jsonl": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+    "mbpp-README.md": "02d63a4ffdad806c3c87b5ea2aa91e946f6eec0c2869643b09831650883f41be",
+    "mbpp.jsonl": "ccf64ceae9c5403bf50a044cb6d505bfd2a2963ee58338ba268fd65beab92a9f"
+  },
+  "licenses": {
+    "gsm8k": "MIT",
+    "mbpp": "CC-BY-4.0 (dataset, per repository README)"
+  },
+  "tokenization": "raw text; native automatic BOS; parse-special default; no escape interpretation; no chat template; reset per document",
+  "holdout_per_stratum_minimum_scored_tokens": 50000,
+  "calibration_per_stratum_minimum_scored_tokens": 2000,
+  "observed_scored_tokens": {
+    "calibration": {
+      "problem-prose": 2021,
+      "python-code": 2037
+    },
+    "holdout": {
+      "problem-prose": 50085,
+      "python-code": 50043
+    }
+  },
+  "selected_documents": 550,
+  "corpus_sha256": "6430ee2d8c5cd8e338465a3c5f57dab0e0b15c94142741791183fba5f8fc18ef",
+  "split_and_selection": "fixed SHA256 ID ranking; calibration-first exact text/code dedup; whole documents",
+  "max_document_tokens": 4096,
+  "limitations": "math-problem prose and Python only; shared task styles; no claim of pretraining exclusion, semantic dedup or broad-language coverage",
+  "status": "candidate frozen inputs; quality protocol review and model NLL capture pending",
+  "native_reference": "Exact model/tokenizer identities remain in private configuration; candidate provenance is documented in docs/epic-1-evidence.md."
+}
