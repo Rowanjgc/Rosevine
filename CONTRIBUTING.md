@@ -29,6 +29,13 @@ Language-specific formatters, linters, compiler checks, unit tests, sanitizers a
 build verification will be added after an accepted language/backend decision.
 
 Test observable behavior and important failure paths. Match verification to risk.
+Use focused checks during iteration and the full check before handoff; do not
+repeat unrelated expensive checks without a changed risk or failed result.
+Follow the [proportionate run policy](docs/development/rule-audit.md): safety stops,
+measurement acceptance and publication requirements have different purposes.
+Diagnostic warnings do not establish performance acceptance or automatically
+prevent bounded investigation. Updating a research threshold requires documented
+rationale and regression coverage; it never permits bypassing privacy/security checks.
 Update affected documentation, examples and acceptance criteria. Consequential
 architecture changes require a human-accepted [ADR](docs/adr/README.md).
 Security, hooks, workflow permissions, allowlists, dependencies and benchmark

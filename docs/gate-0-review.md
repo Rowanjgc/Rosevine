@@ -47,6 +47,31 @@ not accept an ADR, approve an unvalidated run budget or authorize a workload.
 | Thermal/display reserves and idle window | Maintainer | Blocks GPU pilot; review H1 budget with sensor-specific limits before a concrete isolated invocation |
 | RAM timings/bandwidth and GPU counter support | Environment/backend follow-up | Blocks timing/bandwidth/counter conclusions; explicit unknowns do not invalidate descriptor inspection |
 
+## When to re-evaluate
+
+Revisit this NO-GO when the evidence changes; there is no calendar wait. The later
+[bounded CPU diagnostic](epic-2-pilot-review.md) and two-position logit smoke capture
+show that a small CPU-requested run can load/evaluate tokens and that the capture
+path works. They do not satisfy the performance gate: they are too small to measure
+the target workloads, do not exercise the GPU, and do not validate observer effect.
+
+Before proposing GO for baseline performance work, B1 should show the collector's
+p95 cycle cost below 1 ms and a paired collector-off/on end-to-end change whose
+95% interval lies within +/-1%, with cancellation and cleanup evidence. The run
+manifest must freeze exact input token IDs, sampler/stop policy, executable and
+resolved library identities; any unresolved upstream or source-build lineage must
+be called out as a scope limit rather than treated as equivalence. The selected
+device, sensors, resource reserves and run envelope must be validated for the
+specific GPU experiment, with an approved idle window and concrete invocation.
+Unsupported counters may remain unknown only when the planned claims do not depend
+on them. Then update this gate with the new evidence, restrictions and downstream
+activation decision before starting B3.
+
+This is a readiness checklist, not a GO decision or run authorization. Upstream
+conversion lineage, image preprocessing and other unrelated fidelity gaps need
+only be resolved before making the corresponding claims; a restricted text-only
+baseline can state those limits explicitly.
+
 ## Review record
 
 Reviewed by epic1-research on 2026-11-11 against H1/H2 criteria, the baseline,

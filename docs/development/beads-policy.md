@@ -1,8 +1,10 @@
 # Beads integration policy
 
-Project Zero inspects tooling only: no `.beads` initialization, issues, enrollment,
+The historical Project Zero assignment inspected tooling only: no `.beads` initialization, issues, enrollment,
 research roadmap or GitHub synchronization. Installed `br` was verified as 0.7.6.
 Before later adoption, recheck CLI help and get approval for the storage workflow.
+That adoption was subsequently authorized; the local tracker now exists. Do not
+repeat initialization or request adoption approval for ordinary issue updates.
 
 Beads Rust uses `.beads/` with SQLite working data, journals/WAL/SHM, backups,
 configuration, and portable `issues.jsonl` exports. Mutations normally auto-flush

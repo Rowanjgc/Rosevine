@@ -1,13 +1,14 @@
 # Experiment protocol
 
-Version: proposed v1, 2026-11-11. Gate 1 must freeze the workload manifest,
+Version: proposed v2, 2026-11-12 (proportionate diagnostic/resource policy).
+The original v1 run records remain unchanged. Gate 1 must freeze the workload manifest,
 tolerance tables and stopping rules before optimization results are collected.
 Changes create a new protocol version and rerun affected comparisons. No new
 benchmark was executed during planning.
 
 ## Authorization and run envelope
 
-Run offline against an isolated executable and endpoint in an agreed idle
+Run offline with an isolated executable, or an isolated endpoint when needed, in an agreed idle
 window. Do not evict another workload or edit the router. Before each session,
 check available disk/RAM/VRAM, display reserve, activity and swap pressure.
 Record the current resource budget and cancellation behavior. Begin with bounded
@@ -19,10 +20,17 @@ system MemAvailable and 0.5 GiB device headroom. Validate the headroom policy fo
 display and allocation spikes before enabling it. The historical 15.54 GiB peak
 may violate that proposed device reserve: report that conflict and seek a reviewed
 run budget rather than silently lowering the reserve or claiming the preset fits.
-Cancel on allocation failure, GPU reset/hang, growing swap-in/out, resource-budget
+Cancel on allocation failure, applicable device reset/hang, sustained significant
+paging with low RAM headroom, resource-budget
 breach or an agreed thermal limit derived from device documentation. Preserve
 partial evidence as failed/incomplete. Never change power limits or clocks for a
 trial without specific authorization.
+
+The [current run policy](development/rule-audit.md) defines diagnostic warnings,
+hard stops and authorization reuse. Record small system-wide paging events and
+counter resets; do not terminate on a single page or invent process attribution.
+Collector cost, optional counters and scientific sample counts constrain claims,
+not every bounded diagnostic. The immediate hard RAM reserve remains enforced.
 
 ## Immutable run identity
 
@@ -98,7 +106,7 @@ overlapping spans as elapsed time. Verify counters against a known small workloa
 | Steady output rate | For N committed outputs, `(N-1)/(last_token_time-first_token_time)` when N > 1; distinct from whole-loop throughput |
 | TTFT | Request admitted to first committed output delivered; report queue, rendering/tokenization, prefill and first decode components; cold-load TTFT separately |
 | End-to-end latency | Admission to final committed output/cancellation, including host overhead; report reasoning and visible-token accounting explicitly |
-| MTP | Proposed and accepted counts, accepted/proposed, per-position conditional acceptance denominators, mean committed tokens/verification, target evaluated rows, draft/verify/correction time and rollback work |
+| MTP | Proposed and accepted counts, `mtp_acceptance_rate` (accepted/proposed), per-position conditional acceptance denominators, mean committed tokens/verification, target evaluated rows, draft/verify/correction time and rollback work |
 | VRAM | Total device used at idle, sampled run peak, steady p50/p95 and process allocations if available; report sampling period and instrumented allocation high-water mark separately |
 | System RAM | Process RSS/PSS, anonymous/file-backed split and high-water RSS; MemAvailable, page faults and swap-in/out; do not double-count mapped pages and page cache |
 | Utilization | GPU busy and CPU core-time normalized with stated convention (one core or whole system); sampled, not a proof of bottleneck |

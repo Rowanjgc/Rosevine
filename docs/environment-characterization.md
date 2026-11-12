@@ -56,11 +56,14 @@ python3 .private/epic1/telemetry-overhead.py "$GPU_BUSY_FILE" "$VRAM_USED_FILE"
 ```
 
 The script and exact private paths are intentionally outside public tooling.
-For a future collector, start with 100 ms sampling; require p95 collector-cycle
-cost below 1 ms and less than 1% paired workload-time perturbation in alternating
-collector-off/on trials. The current 100-read median/max check is only a
+For a future benchmark collector, start with 100 ms sampling; target p95 collector-cycle
+cost below 1 ms and require the 95% paired interval for collector-off/on end-to-end
+time change to lie strictly within +/-1%. The current 100-read median/max check is only a
 preliminary host-cost check and does not meet that workload-overhead criterion.
 B1 owns that validation and cancellation instrumentation.
+These are measurement-quality criteria, not hardware-safety stops for a bounded
+allocation diagnostic. The [current rule policy](development/rule-audit.md)
+separates collector response deadlines from diagnostic cost warnings.
 
 Proposed pilot budget for human review: isolated offline process, one sequence,
 context at most 4096, at most 32 generated tokens per smoke request, one request,
@@ -73,13 +76,17 @@ does not establish that any model configuration fits.
 
 Before activation, B1 must implement a supervisor that checks these thresholds
 before launch and during a run, checks pswpin/pswpout deltas over successive
-samples, cancels on budget breach/reset/allocation failure/increasing paging,
+samples, cancels on budget breach/allocation failure or sustained significant
+paging under low memory headroom,
 and records failed/incomplete output. Exercise it first with synthetic telemetry
 at each threshold, a sleeping child and a child ignoring termination; verify
 forced kill after grace and evidence preservation. Then use an agreed idle window
 for the smallest actual workload, before any historical preset reproduction.
-No workload may start until a reviewer approves sensor-specific thermal limits,
-display reserve, the run window and the concrete invocation. Clock/power settings,
+Before a model run, establish an authorized profile with sensor-specific thermal
+limits, display reserve, run scope and concrete invocation. Existing approval
+carries across bounded follow-ups within that profile; preparation does not
+consume an artificial approval timer. Recheck live resources immediately before
+launch. Clock/power settings,
 services, drivers and the router remain unchanged.
 
 ## Unknown owners and impact

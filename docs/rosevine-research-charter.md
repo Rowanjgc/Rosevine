@@ -13,8 +13,11 @@ Rosevine is independent of the production llama.cpp router and BlackroseAI.
 Repository contributions retain GPL-3.0; model and dependency licenses need
 separate provenance review before redistribution.
 
-The immediate deliverable is research planning. No runtime, inference kernel,
-GPU benchmark, installation or model transformation is part of this assignment.
+The original assignment's deliverable was research planning; runtime work, GPU
+benchmarks, installs and transformations were outside that planning assignment.
+Later direct implementation requests authorize their stated work under the
+[current run policy](development/rule-audit.md). This historical planning scope
+does not prohibit the bounded diagnostics needed for implementation.
 The direct handoff authorizes research-roadmap creation and private local Beads
 adoption after Project Zero. Its storage and privacy controls continue to apply.
 
