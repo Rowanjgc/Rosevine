@@ -35,6 +35,9 @@ model. Ignored private files are not opened by worktree checks.
 Use the [standards and Definition of Done](../../CONTRIBUTING.md). Identify criteria
 and accepted ADRs before implementation. Track evidence and honest status. Ask for
 human approval of consequential decisions, guardrail changes and publication.
+Existing user authorization covers routine implementation and bounded research
+within its approved resource scope; do not request it again for each diagnostic
+command. See the [rule audit](rule-audit.md) for diagnostic versus benchmark gates.
 Do not weaken checks for convenience. Tool failure blocks publication; bootstrap
 or investigate locally. No security bypass flag exists in project commands.
 
