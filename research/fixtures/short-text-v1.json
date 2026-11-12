@@ -1,0 +1,16 @@
+{
+  "version": "rosevine-short-text-v1",
+  "license": "GPL-3.0-only",
+  "provenance": "Original synthetic fixtures authored for Rosevine; no external corpus or personal prompts.",
+  "padding": " Context record: amber birch cedar delta ember fern granite harbor.",
+  "fixtures": [
+    {"id": "prose-summary", "category": "prose", "prompt": "Summarize the records in three sentences and distinguish observations from guesses."},
+    {"id": "prose-continuation", "category": "prose", "prompt": "Write a short fictional scene about a gardener cataloguing seeds."},
+    {"id": "code-review", "category": "code", "prompt": "Explain the boundary cases of this Python function: def mean(xs): return sum(xs) / len(xs)."},
+    {"id": "code-generation", "category": "code", "prompt": "Write a Python function that merges two sorted integer lists, preserving duplicates, and explain its complexity."},
+    {"id": "arithmetic-sum", "category": "arithmetic", "prompt": "Compute 37 times 24 plus 119. Show intermediate steps and verify the answer."},
+    {"id": "arithmetic-ratio", "category": "arithmetic", "prompt": "A box has 18 red and 12 blue tiles. Six red tiles are removed. Give the remaining red fraction in lowest terms."},
+    {"id": "structured-json", "category": "structured instructions", "prompt": "Return only JSON with keys count and colors. Count is 3; colors is the alphabetically sorted list violet, amber, blue."},
+    {"id": "structured-order", "category": "structured instructions", "prompt": "List exactly four numbered steps for sorting a set of labelled cards. Use one sentence per step."}
+  ]
+}
