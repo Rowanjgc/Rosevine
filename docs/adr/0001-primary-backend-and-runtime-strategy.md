@@ -3,7 +3,7 @@
 Status: Accepted
 Date: 2026-11-13
 Human acceptance: maintainer, 2026-11-13, at Gate 2 review (option "HIP + Rust host").
-PR: not yet opened; local branch `research/epic-3-c3`.
+PR: #3 (https://github.com/Rowanjgc/Rosevine/pull/3)
 Supersedes: none
 
 ## Context and problem
