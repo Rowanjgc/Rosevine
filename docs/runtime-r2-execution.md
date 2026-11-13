@@ -184,11 +184,16 @@ and 10.0 GiB at a 512-token batch (the logits scratch grows with the batch). An
 allocation. The CPU executor takes about 140 s per 512-token chunk; HIP takes
 24–28 s per chunk and decodes at 4.1 tokens/s.
 
+**Correction (2026-11-13).** The 4.1 tokens/s figure came from a run that
+probably overlapped a CPU reference generation. Same-work reruns produce identical
+tokens and decode at 13.4–14.0 tokens/s with N = 10. See the
+[optimization research follow-up](optimization-research.md#s1-decode-discrepancy-environmental-not-a-methodology-difference-measured).
+
 ## Limits
 
 - **Speed is not a goal here.** The CPU executor uses scalar-friendly Rust loops, about
   140 s per 512-token chunk on 10 threads. The HIP kernels are untuned, and decode
-  runs at about 4 tokens/s with 10 CPU expert layers. Specialization is later work.
+  runs at about 13–14 tokens/s with 10 CPU expert layers (corrected; see Resources). Specialization is later work.
 - **Reference-side approximations are not reproduced.** The pinned CPU backend
   quantizes activations to Q8_0 before every Q4_0 matmul and looks GELU up in an f16
   table. R2 keeps f32 activations and the exact tanh GELU. The layer-0 gap is
