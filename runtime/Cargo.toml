@@ -1,0 +1,20 @@
+[package]
+name = "rosevine-runtime"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+description = "Rosevine Gemma 4 reference runtime: validated artifact and text-input contracts (R1)"
+publish = false
+
+# No third-party dependencies (CONTRIBUTING: add dependencies only for a demonstrated need).
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+debug = 1

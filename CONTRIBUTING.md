@@ -25,8 +25,9 @@ Keep builds reproducible: pin tools/dependencies, document provenance and build
 flags, separate downloads from build steps, review licenses and security impact.
 Add dependencies only for a demonstrated need. Tool upgrades require checksum/
 immutable-pin review and guardrail tests. Do not silently install global packages.
-Language-specific formatters, linters, compiler checks, unit tests, sanitizers and
-build verification will be added after an accepted language/backend decision.
+The Rust runtime (`runtime/`, ADR 0001) is checked by rustfmt, clippy with warnings
+as errors, and its tests through `./scripts/check.sh`; HIP kernel build checks arrive with
+the first kernels.
 
 Test observable behavior and important failure paths. Match verification to risk.
 Use focused checks during iteration and the full check before handoff; do not
