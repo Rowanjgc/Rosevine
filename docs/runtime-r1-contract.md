@@ -122,7 +122,7 @@ tests use only synthetic data.
 - **Tie order.** The order of equal-length special tokens is ID-based. Upstream's
   order is unspecified (`std::sort`); this matters only if two different
   equal-length special texts overlap in one input, which no test exercises.
-- **Detokenization** is not implemented (R2/S1 need it for outputs).
+- **Detokenization** is not implemented. R2 verified outputs as token IDs and detokenized privately with the reference; S1 needs it in the runtime.
 - **Model scope.** Only the target model is covered. The MTP assistant and the
   projector contracts are later work (S2, V1).
 - **Template scope.** The configured (personal) template variant is out of scope.

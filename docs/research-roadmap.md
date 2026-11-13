@@ -88,8 +88,8 @@ Detailed criteria are maintained in Beads, with shared definitions in the
 | C2 | rv-e03-mmf.2 | Vulkan feature/shader/pipeline/ISA and exact-shape/full-model evaluation | G1 |
 | C3 | rv-e03-mmf.3 | Triton feasibility; identical-kernel C++/Rust FFI and automation costs | G1 |
 | G2 | rv-e03-mmf.4 | Gate 2 backend/runtime ADR and human decision | C1, C2, C3 |
-| R1 | rv-e04-398.1 | Deferred: validated GGUF/mmap/tokenizer and text/modality input boundary | G2, H2, B2 |
-| R2 | rv-e04-398.2 | Deferred: exact target-only graph, static placement, Q8_0 KV and cleanup | R1 |
+| R1 | rv-e04-398.1 | Done: validated GGUF/mmap/tokenizer and text/modality input boundary ([R1](runtime-r1-contract.md)) | G2, H2, B2 |
+| R2 | rv-e04-398.2 | Done: CPU and HIP target-only executors, static first-N placement, Q8_0 KV ([R2](runtime-r2-execution.md)) | R1 |
 | G3 | rv-e04-398.3 | Gate 3 target-only reference correctness | R2, B2 |
 | K1 | rv-e05-7n3.1 | Critical-path attribution, counters/timestamps and ranked hypotheses | G3, S1 |
 | K2 | rv-e05-7n3.2 | Deferred: Q4_0 GEMV/GEMM, unpack/packing and integrated benefit test | K1 |
