@@ -19,7 +19,8 @@ the external baseline.
 
 | Label | What | Use |
 | --- | --- | --- |
-| `vk-ref` | Pinned llama.cpp Vulkan reference with the matching preset (ADR 0001 decision 2) | The only external performance baseline (Gate 4) |
+| `vk-ref` | Pinned llama.cpp Vulkan reference with the matching preset (ADR 0001 decision 2) | Primary external performance baseline (Gate 4) |
+| `hip-ref` | llama.cpp HIP from the same frozen source as Vulkan | Separate same-backend diagnostic baseline; never substitutes for Vulkan |
 | `r2-ref` | Rosevine R2 HIP, `first_n(10)`, untuned kernels, at a fixed commit: about 13.4–14.0 tokens/s decode, 72 ms/token (S1; the earlier 4.1 was contaminated) | Internal ablation baseline; correctness reference for placement and scheduling changes |
 | `r2-cpu` | Rosevine CPU executor | Numerics reference for host paths |
 | `tuned-k` | Rosevine after a K2/K3 kernel milestone | Baseline for overlap, cache and prefetch studies (see below) |
@@ -92,7 +93,9 @@ kernel speed, or the dependence is explicit.
 ## What must wait
 
 - **Wait for `tuned-k`.**
-  - Any end-to-end tokens/s or TTFT comparison against `vk-ref`.
+  - Gate 4 success claims against `vk-ref`. Early diagnostic comparisons are
+    allowed under the [parity amendment](performance-parity.md), which requires
+    matched timing boundaries and explicit untuned status. R3a stays internal-only.
   - Overlap, prefetch and dynamic-cache benefit. Slow kernels inflate the GPU
     time that can hide transfers, so benefits measured on R2 overstate what a
     tuned runtime would see.

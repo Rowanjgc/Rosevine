@@ -31,6 +31,11 @@ later work should use.
   - That makes each optimization independently switchable, recorded in the run
     manifest and comparable in a paired A/B run.
 
+Low-level kernel independence is not an objective. The proposed
+[parity and reuse amendment](performance-parity.md) evaluates direct ports,
+adapted techniques and selective GGML reuse while preserving current ownership,
+HIP/Rust and C ABI commitments pending separate architecture review.
+
 ## Modules and ownership
 
 | Module | Owns | Today in R2 | New responsibility |
