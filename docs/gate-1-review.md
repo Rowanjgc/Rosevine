@@ -88,8 +88,9 @@ repeat within 1.6–5%. ABBA probes ruled out two alternatives:
 - 100 ms clock sampling: off 100.3/100.2, on 100.5/100.7 tokens/s.
 - CPU pinning to physical cores: pinned 45.0/44.8/45.0, free 46.3 ×3.
 
-The GPU uses the `auto` performance level with the boot-default power profile.
-Changing it is a power-setting change outside agent authority.
+The campaign ran under the `auto` performance level with the boot-default power
+profile. The maintainer has since chosen a fixed profile; see
+[Power profile decision](#power-profile-decision-rv-19d).
 
 **Desktop VRAM headroom.** Other clients' VRAM grew from 0.76 to 1.31 GiB partway
 through the campaign. Two later controls then show collapsed prefill (741–800 vs
@@ -153,9 +154,10 @@ GO (restricted). Rerunning the same manifest repeats within a documented envelop
 (about ±1% within a clock state), correctness controls exist and are usable, and
 every missing metric is labelled. Conditions on later candidate comparisons:
 
-1. **Clock state.** Record per-request GPU clocks. Compare within one clock state,
-   or under a fixed power profile set by the maintainer. A difference smaller than
-   the 17–36% clock-state spread is not evidence when states differ.
+1. **Clock state.** Run benchmark windows under the COMPUTE power profile
+   ([decision](#power-profile-decision-rv-19d)) and record per-request GPU clocks.
+   Do not compare results across power profiles. The `auto`-profile numbers above
+   are a separate baseline.
 2. **VRAM headroom.** Record idle desktop VRAM and minimum free VRAM. Flag any
    comparison where either configuration runs below about 0.3 GiB free or where
    desktop VRAM changed between arms.
@@ -168,12 +170,50 @@ every missing metric is labelled. Conditions on later candidate comparisons:
    Vulkan–CPU gap until that gap is explained.
 5. Greedy output identity is not a correctness criterion on Vulkan.
 
+## Power profile decision (rv-19d)
+
+The maintainer chose to use the faster power profile. A probe compared four amdgpu
+power states on the same 1900-token requests (8 measured per session). The
+sessions ran in ABBA order, so each profile ran twice for the two
+clock-sensitive configurations.
+
+| Configuration | auto (boot default) | COMPUTE | 3D_FULL_SCREEN | forced `high` |
+| --- | --- | --- | --- | --- |
+| Default preset (n-cpu-moe 2, MTP) | 100.3 / 99.0 | **128.3 / 126.7** | 98.3 / 100.0 | 119.5 / 121.1 |
+| 64k, n-cpu-moe 8, MTP off | 46.3 / 46.3 | **59.6 / 59.6** | 46.3 / 46.2 | 58.1 / 58.1 |
+| Fast preset (VRAM-spilled, see below) | 108.9 | 109.6 | 108.6 | 103.8 |
+| Shader clock, CPU-heavy configs | 1280–1675 MHz | 2289–2407 MHz | 1280–1659 MHz | 2032–2064 MHz |
+
+Decode tokens/s are session medians.
+
+- COMPUTE is the fastest profile: +27% on the default preset and +29% at
+  n-cpu-moe 8 over `auto`.
+- COMPUTE holds a single shader-clock state, so the bimodality disappears. Its two
+  sessions agree within 1.3%.
+- Forced `high` caps the shader clock near 2050 MHz and is slower than COMPUTE
+  everywhere.
+- 3D_FULL_SCREEN behaves like `auto`.
+- No request crossed a thermal data-quality flag. Peak GPU junction temperature
+  rose from 79–83 °C to 84–86 °C.
+
+The fast-preset row is not a clean measurement. The production router's desktop
+VRAM (1.3 GiB) left 0.08 GiB free, and prefill collapsed to about 800 tokens/s,
+the same spill signature as above. All four profiles were equally affected. This
+probe does not show whether COMPUTE changes the fast preset when it is not
+spilled; a GPU-bound configuration already ran near 2400 MHz under `auto`.
+
+Benchmark windows now run under COMPUTE.
+[gpu_power_window.py](../scripts/gpu_power_window.py) sets the profile through
+non-interactive `sudo` and verifies it. It then runs the command and always
+restores `auto` / BOOTUP_DEFAULT, including on interrupt. Sessions can declare
+`"power_profile": "compute"`, and preflight then refuses to start under any other
+state. Preflight records the active state in every session. The GPU's default
+outside benchmark windows is unchanged.
+
 ## Open items and deferrals
 
 - **Vulkan–CPU logit divergence** (KLD 0.056, 6.5% top-1 disagreement): diagnose
   with the independent scalar oracles before Gate 3 reference-execution claims.
-- **GPU power profile:** a maintainer decision on a fixed compute profile for
-  benchmark windows would remove the clock-state bimodality.
 - **Deferred from the minimal scope:** interaction cells; the 100-task and NLL
   quality evaluation on the holdout split; MTP draft-length sweeps; the sampled
   (temperature 1.0) policy; full 4096-position and per-layer intermediate captures;
