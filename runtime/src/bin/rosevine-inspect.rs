@@ -9,9 +9,11 @@
 //! rosevine-inspect dump     <gguf> --out <dir> [--logits-tail K] [--no-observe] [--debug-no-swa]  # stdin: token ids
 //! rosevine-inspect generate <gguf> --n <steps> [--batch B] [--threads T] [--ctx C] [--instr host|sync|events]
 //!                                                     # stdin: prompt token ids
+//! rosevine-inspect replay   <gguf> --n-prompt P --n-decode D [--reps R] [--batch B] [--threads T] [--ctx C]
+//!                                                     # stdin: P + D frozen token ids (parity P1)
 //! ```
 //!
-//! `kld`, `generate` and `dump` take `--backend cpu|hip` (hip needs the `hip` feature) with
+//! `kld`, `generate`, `replay` and `dump` take `--backend cpu|hip` (hip needs the `hip` feature) with
 //! `--cpu-moe N` (first N layers keep experts on the CPU), `--max-vram-gib G` and
 //! `--vram-reserve-gib R`.
 
@@ -156,6 +158,7 @@ fn run(args: &[String]) -> Result<(), Error> {
         }
         "kld" => kld(args, &g, &mut out)?,
         "generate" => generate(args, &g, &mut out)?,
+        "replay" => replay(args, &g, &mut out)?,
         "dump" => dump(args, &g)?,
         _ => return Err(Error::UnsupportedInput("unknown command")),
     }
@@ -471,6 +474,86 @@ fn generate(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error
     )
     .ok();
     Ok(())
+}
+
+/// Parity P1 engine-only replay: prefill the first `P` frozen ids, then feed the next `D` ids one
+/// at a time. Every evaluation ends with last-position logits on the host; nothing is sampled, so
+/// both arms of a comparison route the same tokens. Output matches `research/parity_replay.cpp`:
+/// one JSON config line, then one line per repetition with synchronized nanosecond timings.
+fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> {
+    let n_prompt: usize = opt(args, "--n-prompt").ok_or(Error::UnsupportedInput("--n-prompt required"))?;
+    let n_decode: usize = opt(args, "--n-decode").ok_or(Error::UnsupportedInput("--n-decode required"))?;
+    let reps: usize = opt(args, "--reps").unwrap_or(1);
+    if n_prompt == 0 || !(1..=1000).contains(&reps) {
+        return Err(Error::UnsupportedInput("--n-prompt must be positive and --reps 1..=1000"));
+    }
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let mut toks = Vec::new();
+    for t in line.split_whitespace() {
+        toks.push(t.parse::<u32>().map_err(|_| Error::UnsupportedInput("malformed token id"))?);
+    }
+    if toks.len() < n_prompt + n_decode {
+        return Err(Error::UnsupportedInput("token input shorter than prompt plus decode"));
+    }
+    toks.truncate(n_prompt + n_decode);
+    let w = Weights::bind(g)?;
+    let cfg = exec_config(args, n_prompt + n_decode, 64);
+    let (ctx, batch, threads) = (cfg.max_ctx, cfg.max_batch, cfg.threads);
+    let mut sess = Exec::new(args, &w, cfg)?;
+    let backend = opt::<String>(args, "--backend").unwrap_or_else(|| "cpu".into());
+    let cpu_moe: usize = if backend == "hip" { opt(args, "--cpu-moe").unwrap_or(10) } else { 0 };
+    writeln!(
+        out,
+        "{{\"schema\":\"rosevine-parity-replay-v1\",\"kind\":\"config\",\"engine\":\"rosevine\",\
+         \"backend\":\"{backend}\",\"n_prompt\":{n_prompt},\"n_decode\":{n_decode},\"reps\":{reps},\
+         \"n_ctx\":{ctx},\"n_batch\":{batch},\"n_ubatch\":{batch},\"threads\":{threads},\
+         \"cpu_moe_layers\":{cpu_moe},\"kv_type\":\"q8_0\",\"cpu_expert_activation\":\"f32\",\
+         \"expert_kernel\":\"{}\",\"expert_wait\":\"{}\",\"tokens_fnv1a64\":\"{:016x}\"}}",
+        opt::<String>(args, "--expert-kernel").unwrap_or_else(|| "auto".into()),
+        opt::<String>(args, "--expert-wait").unwrap_or_else(|| "sleep".into()),
+        fnv1a64(&toks)
+    )
+    .ok();
+    let never = || false;
+    for rep in 0..reps {
+        sess.reset();
+        let t0 = Instant::now();
+        let chunks = toks[..n_prompt].chunks(batch).count();
+        for (i, ch) in toks[..n_prompt].chunks(batch).enumerate() {
+            let lg = sess.eval(ch, if i + 1 == chunks { Logits::Last } else { Logits::None }, &never, None)?;
+            std::hint::black_box(lg.first());
+        }
+        let prefill_ns = t0.elapsed().as_nanos();
+        let mut steps = Vec::with_capacity(n_decode);
+        for &t in &toks[n_prompt..] {
+            let s = Instant::now();
+            let lg = sess.eval(&[t], Logits::Last, &never, None)?;
+            std::hint::black_box(lg.first());
+            steps.push(s.elapsed().as_nanos().to_string());
+        }
+        writeln!(
+            out,
+            "{{\"schema\":\"rosevine-parity-replay-v1\",\"kind\":\"rep\",\"rep\":{rep},\
+             \"prefill_ns\":{prefill_ns},\"decode_ns\":[{}]}}",
+            steps.join(",")
+        )
+        .ok();
+        out.flush().ok();
+    }
+    Ok(())
+}
+
+/// FNV-1a 64 over little-endian u32 ids; identical to the llama.cpp replay adapter's binding hash.
+fn fnv1a64(toks: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for t in toks {
+        for b in t.to_le_bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
 }
 
 /// Run one batch and write every observed intermediate as `<name>-<layer>.bin`: an i32 type tag
