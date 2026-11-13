@@ -171,7 +171,7 @@ benchmark scheduling waits for R3a.2 and R3a.3 to preserve the active sequence.
 
 | Step | Deliverable | Prerequisites |
 | --- | --- | --- |
-| P1 (`rv-two`) | Frozen workload/metric contract and Vulkan/HIP baseline adapters; fixtures that reject mismatched boundaries/profiles | Existing benchmark manifest/metrics infrastructure; no R3a code edits |
+| P1 (`rv-two`) | Frozen workload/metric contract and Vulkan/HIP baseline adapters; fixtures that reject mismatched boundaries/profiles. Done: [parity contract](parity-contract.md) | Existing benchmark manifest/metrics infrastructure; no R3a code edits |
 | P2 (`rv-aa8`) | Full pinned reuse audit, A/B/C/D register and limited-integration comparison | None; consumes R3a findings when available |
 | P3 (`rv-tkd`) | Paired baseline collection, numerical checks, resource/CPU controls and subsystem gap report | P1, P2, R3a.2, R3a.3; extend existing K1 rather than duplicate it |
 | P4 (`rv-9zf`) | Ranked gap-closure plan and per-workload P90 → parity → advantage scorecards | P3; each implementation separately scoped, existing K2/K3 reused |

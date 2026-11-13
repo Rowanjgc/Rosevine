@@ -16,13 +16,14 @@ cargo test --offline --locked          # also run by ../scripts/check.sh
 cargo build --offline --locked --release [--features hip]
 target/release/rosevine-inspect validate <target.gguf> [--sha256 <hex>]
 target/release/rosevine-inspect generate <target.gguf> --n 64 [--backend hip --cpu-moe 10]  # stdin: token ids
+target/release/rosevine-inspect replay <target.gguf> --n-prompt P --n-decode D [--reps R] [--backend hip]  # parity P1, stdin: P+D ids
 cargo test --offline --features hip --test hip_ops -- --ignored   # GPU kernel conformance (needs a GPU)
 ```
 
 The `hip` feature needs ROCm's `hipcc`. It targets gfx1101 by default; set `ROSEVINE_HIP_ARCH`
 to override.
 
-`generate`, `kld` and `dump` accept `--expert-kernel auto|scalar|avx2|avx512`
+`generate`, `replay`, `kld` and `dump` accept `--expert-kernel auto|scalar|avx2|avx512`
 and `--expert-wait sleep|hybrid|spin`. Defaults are auto and sleep. Hybrid polls
 for at most 20 microseconds, spin for at most 100 microseconds, then workers park.
 AVX-512 requires Rust 1.89+ at build time; older supported compilers retain AVX2/scalar.
