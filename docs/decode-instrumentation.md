@@ -46,3 +46,6 @@ device time.
   0.035 ms on the device timeline; four similar uploads on GPU-expert layers take 0.085 ms in
   total. Candidate causes: GPU idle-state wake after about 5 ms without work, or runtime staging.
 - Host-layer minus GPU-layer total is about 5.47 ms, consistent with the earlier 5.40 ms slope.
+
+The bounded follow-up controls and their limitations are recorded in
+[decode critical-path attribution (R3a.2)](decode-attribution.md).
