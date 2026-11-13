@@ -3,7 +3,8 @@
 Date: 2026-11-13.
 
 **Status.** The maintainer approved the direction and R3a on 2026-11-13, with
-decisions D1–D7 below. Only the R3a Beads are installed. Later phases are
+decisions D1–D7 below. R3a Beads are installed; the proposed parity infrastructure track is listed in the
+[parity amendment](performance-parity.md). Other later phases are
 recorded here and in notes on existing Beads, so the backlog stays small until the
 foundation is validated.
 
@@ -31,7 +32,10 @@ documents:
 ## Principles
 
 - Measured improvements and clean foundations come before technique count.
-- No benchmark claims against the Vulkan baseline before `tuned-k`. R3a results
+- Performance parity precedes advanced optimization; reuse mature upstream kernels
+  where justified. See the [proposed parity track](performance-parity.md) for
+  workload-specific P90, parity and specialization milestones and source pins.
+- Early external comparisons are diagnostics, not Gate 4 success claims. R3a results
   are internal ablations against `r2-ref` (about 13.4–14.0 tokens/s at N = 10,
   corrected in S1).
 - Every item declares a correctness class and a measurable completion criterion.
