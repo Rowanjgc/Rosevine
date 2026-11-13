@@ -1,7 +1,8 @@
 # Architecture options
 
-Status: proposed, 2026-11-11. No accepted ADR chooses a language, backend,
-compiler, memory policy or model representation. Local evidence is in the
+Status: proposed, 2026-11-11. Backend and host language were since decided by
+[ADR 0001](adr/0001-primary-backend-and-runtime-strategy.md) (Gate 2, 2026-11-13); no
+accepted ADR chooses a compiler strategy, memory policy or model representation. Local evidence is in the
 [baseline](hardware-and-inference-baseline.md); decisions require the
 [roadmap gates](research-roadmap.md) and [protocol](experiment-protocol.md).
 

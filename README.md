@@ -2,7 +2,8 @@
 A custom LLM inference engine tailored for Gemma4 26B A4B QAT on a 7800XT GPU.
 
 Project Zero establishes privacy and engineering guardrails before inference
-research. Runtime language and backend remain undecided. Licensed under GPL-3.0;
+research. Backend and host language are set by
+[ADR 0001](docs/adr/0001-primary-backend-and-runtime-strategy.md). Licensed under GPL-3.0;
 see [LICENSE](LICENSE). This project does not replace the production llama.cpp router.
 
 ```sh
