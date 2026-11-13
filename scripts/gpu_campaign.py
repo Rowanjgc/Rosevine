@@ -86,12 +86,14 @@ def preset_argv(binary, preset, *, overrides=None, remove=()):
 
 def load_session(path):
     session = json.loads(Path(path).read_text())
-    if not isinstance(session, dict) or set(session) - (REQUIRED | {'notes', 'collector_enabled', 'sample_clocks', 'cpu_affinity', 'mode'}) or REQUIRED - set(session):
+    if not isinstance(session, dict) or set(session) - (REQUIRED | {'notes', 'collector_enabled', 'sample_clocks', 'cpu_affinity', 'mode', 'power_profile'}) or REQUIRED - set(session):
         raise ValueError('session schema invalid')
     if session['schema'] != SCHEMA or set(session['limits']) != LIMITS:
         raise ValueError('session schema/limits invalid')
     if session.get('mode', 'server') not in ('server', 'command'):
         raise ValueError('mode must be server or command')
+    if 'power_profile' in session and session['power_profile'] not in POWER_PROFILES:
+        raise ValueError(f'power_profile must be one of {sorted(POWER_PROFILES)}')
     if session.get('mode') == 'command':
         if session['requests']:
             raise ValueError('command sessions take no requests')
@@ -396,9 +398,32 @@ def collect(session_path):
     serve(sample)
 
 
+# Benchmark-window GPU power state (maintainer decision rv-19d): expected
+# power_dpm_force_performance_level and active pp_power_profile_mode name. The
+# runner sets it (root) and restores it; this tool only reads and verifies.
+POWER_PROFILES = {'auto': ('auto', 'BOOTUP_DEFAULT'), 'compute': ('manual', 'COMPUTE')}
+
+
+def power_state(device):
+    """(performance level, active profile name), or None where unreadable."""
+    device = Path(device)
+    try:
+        level = (device / 'power_dpm_force_performance_level').read_text().strip()
+    except OSError:
+        level = None
+    try:
+        active = [line for line in (device / 'pp_power_profile_mode').read_text().splitlines() if '*' in line]
+        profile = active[0].split()[1].rstrip('*:') if active else None
+    except (OSError, IndexError):
+        profile = None
+    return level, profile
+
+
 def preflight(session):
-    """Refuse to start unless the GPU is idle and every foreign server is unloaded."""
+    """Refuse to start unless the GPU is idle, every foreign server is unloaded
+    and any expected power profile is active."""
     device = Path(session['device'])
+    level, profile = power_state(device)
     used = int((device / 'mem_info_vram_used').read_text())
     busy = int((device / 'gpu_busy_percent').read_text())
     foreign = foreign_servers()
@@ -410,8 +435,12 @@ def preflight(session):
         problems.append(f'GPU busy {busy}%')
     if loaded:
         problems.append(f'foreign llama-server with model resident: {sorted(loaded)}')
+    expected = session.get('power_profile')
+    if expected and (level, profile) != POWER_PROFILES[expected]:
+        problems.append(f'power profile {level}/{profile} is not the expected {expected}')
     return {'vram_used_bytes': used, 'gpu_busy_percent': busy,
-            'foreign_servers': len(foreign), 'problems': problems}
+            'foreign_servers': len(foreign), 'power_level': level, 'power_profile': profile,
+            'problems': problems}
 
 
 def run(session_path):

@@ -157,6 +157,24 @@ class GpuCampaignTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gpu_campaign.load_session(path)
 
+    def test_power_profile_is_recorded_and_enforced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            device = Path(tmp)
+            (device / 'mem_info_vram_used').write_text('0')
+            (device / 'gpu_busy_percent').write_text('0')
+            (device / 'power_dpm_force_performance_level').write_text('auto\n')
+            modes = 'PROFILE_INDEX(NAME) CLOCK_TYPE(NAME)\n 0 BOOTUP_DEFAULT{0}:\n    0( GFXCLK) 0\n 5        COMPUTE{1}:\n'
+            (device / 'pp_power_profile_mode').write_text(modes.format('*', ' '))
+            session = {'device': tmp, 'power_profile': 'compute'}
+            check = gpu_campaign.preflight(session)
+            self.assertEqual((check['power_level'], check['power_profile']), ('auto', 'BOOTUP_DEFAULT'))
+            self.assertTrue(any('power profile' in p for p in check['problems']))
+            (device / 'power_dpm_force_performance_level').write_text('manual\n')
+            (device / 'pp_power_profile_mode').write_text(modes.format(' ', '*'))
+            check = gpu_campaign.preflight(session)
+            self.assertFalse(any('power profile' in p for p in check['problems']))
+            self.assertEqual(gpu_campaign.power_state(device / 'missing'), (None, None))
+
     def test_tampered_workload_tokens_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(workload(Path(tmp) / 'w.json', [1, 2]))
