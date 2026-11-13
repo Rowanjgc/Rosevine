@@ -363,3 +363,184 @@ fn observer_sees_every_layer_and_routing() {
     }
     assert!(seen.iter().any(|(n, il, len)| n == "result_norm" && *il == -1 && *len == E));
 }
+
+/// HIP executor on the same synthetic weights (GPU required, so ignored by default:
+/// `cargo test --features hip --test exec -- --ignored`).
+#[cfg(feature = "hip")]
+mod hip_synthetic {
+    use super::*;
+    use rosevine_runtime::hip;
+    use rosevine_runtime::hip_exec::{HipConfig, HipSession};
+    use rosevine_runtime::instr::{Counters, Mode, Span};
+    use rosevine_runtime::sha256;
+
+    pub const PATTERN_HIP: [bool; 4] = [true, false, true, true];
+
+    pub fn hip_cfg(cpu_layers: usize) -> HipConfig {
+        HipConfig { exec: cfg(64, 16), cpu_expert_layers: cpu_layers, max_vram: 1 << 30, vram_reserve: 0 }
+    }
+
+    /// Prefill 12 tokens in one batch, then decode 20 single steps; every step's logits.
+    pub fn run(s: &mut HipSession, toks: &[u32]) -> Vec<f32> {
+        let mut out = Vec::new();
+        out.extend_from_slice(s.eval(&toks[..12], Logits::All, &NEVER, None).unwrap());
+        for &t in &toks[12..] {
+            out.extend_from_slice(s.eval(&[t], Logits::Last, &NEVER, None).unwrap());
+        }
+        out
+    }
+
+    pub fn digest(v: &[f32]) -> String {
+        let b: Vec<u8> = v.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect();
+        sha256::hex(&sha256::digest(&b))
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn hip_synthetic_logits_digest() {
+        hip::init(0).unwrap();
+        let m = model(&PATTERN_HIP, 11);
+        let w = weights(&m);
+        let toks = tokens(32, 9);
+        let mut s = HipSession::new(&w, hip_cfg(2)).unwrap();
+        let a = run(&mut s, &toks);
+        assert!(a.iter().all(|v| v.is_finite()));
+        // Printed so a pre-change build's digest can be compared with a later one (R3a.1).
+        println!("hip synthetic logits sha256 {}", digest(&a));
+    }
+
+    /// Device calls of one single-token decode evaluation with `Logits::Last`, counted by hand
+    /// from `hip_exec.rs` (R3a.1 acceptance): (launches, h2d, d2h, d2d).
+    pub fn hand_count(w: &Weights, cpu_layers: usize) -> (u64, u64, u64, u64) {
+        let used = w.cfg.n_experts_used;
+        // Embedding: ids upload + lookup. Head: norm, GEMV, softcap; logits download.
+        let (mut la, mut h2d, mut d2h, mut d2d) = (1 + 2 + u64::from(w.cfg.final_logit_softcap != 0.0), 1, 1, 0);
+        for (il, l) in w.layers.iter().enumerate() {
+            // Attention: norm, Q, K, (V or a copy), 3 x norm/RoPE, KV store, attention, O, norm, add.
+            la += 11 + u64::from(l.wv.is_some());
+            d2d += u64::from(l.wv.is_none());
+            la += 6; // shared MLP
+            la += 2; // router norm and GEMV
+            d2h += 1; // router logits
+            la += 1; // expert-input norm
+            if il < cpu_layers {
+                d2h += 1; // expert input
+                h2d += 1; // expert output
+            } else {
+                h2d += 4; // idx, pos, scale, weight
+                la += 1 + used + 1 + used + 1; // gather, gate/up per expert, GeGLU, down per expert, combine
+            }
+            la += 4; // post norm, add, norm, add-scale
+        }
+        (la, h2d, d2h, d2d)
+    }
+
+    fn decode_with(mode: Option<Mode>, w: &Weights, toks: &[u32]) -> (Vec<f32>, Option<(u64, String)>) {
+        let mut s = HipSession::new(w, hip_cfg(2)).unwrap();
+        s.set_instrumentation(mode).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(s.eval(&toks[..12], Logits::All, &NEVER, None).unwrap());
+        s.reset_instrumentation();
+        for &t in &toks[12..] {
+            out.extend_from_slice(s.eval(&[t], Logits::Last, &NEVER, None).unwrap());
+        }
+        let info = s.instrumentation().map(|i| {
+            assert_eq!(i.aborted(), 0);
+            (i.evals(), i.summary(&|l| if l < 2 { "host" } else { "gpu" }))
+        });
+        (out, info)
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn instrumentation_never_changes_logits() {
+        hip::init(0).unwrap();
+        let m = model(&PATTERN_HIP, 11);
+        let w = weights(&m);
+        let toks = tokens(32, 9);
+        let (off, info) = decode_with(None, &w, &toks);
+        assert!(info.is_none(), "instrumentation is off by default");
+        // The pre-change build gave 538161bc500296ae7e63231b02e228276f193a35a245a59f2c62015dc7c7fff7.
+        println!("flag off sha256 {}", digest(&off));
+        for mode in [Mode::Host, Mode::Sync, Mode::Events] {
+            let (on, info) = decode_with(Some(mode), &w, &toks);
+            assert_eq!(digest(&on), digest(&off), "{mode:?} changed logits");
+            let (evals, summary) = info.unwrap();
+            assert_eq!(evals, 20);
+            println!("{summary}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn counters_match_the_hand_count_and_spans_close() {
+        hip::init(0).unwrap();
+        let m = model(&PATTERN_HIP, 12);
+        let w = weights(&m);
+        let toks = tokens(32, 3);
+        for mode in [Mode::Host, Mode::Sync, Mode::Events] {
+            let mut s = HipSession::new(&w, hip_cfg(2)).unwrap();
+            s.set_instrumentation(Some(mode)).unwrap();
+            s.eval(&toks[..12], Logits::Last, &NEVER, None).unwrap();
+            s.reset_instrumentation();
+            for &t in &toks[12..] {
+                s.eval(&[t], Logits::Last, &NEVER, None).unwrap();
+            }
+            let i = s.instrumentation().unwrap();
+            let ev = i.evals();
+            let c = i.total().c;
+            let (la, h2d, d2h, d2d) = hand_count(&w, 2);
+            assert_eq!((c.launches, c.h2d, c.d2h, c.d2d), (la * ev, h2d * ev, d2h * ev, d2d * ev), "{mode:?}");
+            assert_eq!(c.syncs, 0, "a decode step with logits makes no explicit sync");
+            // Per-span placement of the blocking calls.
+            for il in 0..PATTERN_HIP.len() {
+                assert_eq!(i.stat(Span::Router, il).c.d2h, ev);
+                if s.host_expert_layer(il) {
+                    assert_eq!(i.stat(Span::ExpIn, il).c.d2h, ev);
+                    assert_eq!(i.stat(Span::ExpOut, il).c.h2d, ev);
+                    let cpu = i.stat(Span::CpuExperts, il).c;
+                    assert_eq!(
+                        Counters { probe_calls: 0, ..cpu },
+                        Counters::ZERO,
+                        "the CPU kernel makes no device call"
+                    );
+                } else {
+                    assert_eq!(i.stat(Span::ExpMeta, il).c.h2d, 4 * ev);
+                    assert_eq!(i.stat(Span::GpuExperts, il).c.blocking(), 0);
+                }
+            }
+            // Spans plus the caller's time between evaluations tile the wall time.
+            let closure = i.total().host_ns as f64 / i.wall_ns() as f64;
+            assert!((0.999..=1.0).contains(&closure), "{mode:?} closure {closure}");
+            if mode == Mode::Events {
+                assert!(i.total().dev_ns > 0);
+                assert_eq!(i.stat(Span::Attn, 0).dev_n, ev);
+            }
+            s.set_instrumentation(None).unwrap();
+            assert!(s.instrumentation().is_none());
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn failed_and_cancelled_evaluations_are_not_counted() {
+        hip::init(0).unwrap();
+        let m = model(&PATTERN_HIP, 13);
+        let w = weights(&m);
+        let toks = tokens(8, 1);
+        let mut s = HipSession::new(&w, hip_cfg(2)).unwrap();
+        s.set_instrumentation(Some(Mode::Events)).unwrap();
+        s.eval(&toks[..4], Logits::Last, &NEVER, None).unwrap();
+        let calls = Cell::new(0);
+        let cancel_late = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 2
+        };
+        assert!(matches!(s.eval(&toks[4..5], Logits::Last, &cancel_late, None), Err(Error::Cancelled)));
+        assert_eq!(s.n_past(), 4);
+        s.eval(&toks[4..5], Logits::Last, &NEVER, None).unwrap();
+        let i = s.instrumentation().unwrap();
+        assert_eq!(i.evals(), 2);
+        assert_eq!(i.aborted(), 1);
+    }
+}

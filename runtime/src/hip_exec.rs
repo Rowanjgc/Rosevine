@@ -7,12 +7,26 @@
 //! with the same code as the CPU executor, so expert selection logic is shared rather than
 //! reimplemented. All device memory is allocated in [`HipSession::new`] against an explicit VRAM
 //! budget, and freed when the session drops.
+//!
+//! Optional instrumentation (R3a.1, [`crate::instr`]) is off by default. Its span boundaries and
+//! the points where the host blocks on queued device work, per layer:
+//! - `attn` and `mlp`: launches only, nothing blocks.
+//! - `router`: the router-logit download blocks, so in `Mode::Host` this span also carries the
+//!   device time of the layer's attention and shared MLP.
+//! - `select`: host only.
+//! - `exp_in`: expert-input norm; on host-expert layers its download blocks.
+//! - `cpu_experts`, `exp_out` (host-expert layers): the CPU kernel, then a blocking upload.
+//! - `exp_meta` (device-expert layers): four blocking uploads, the first of which waits for the
+//!   expert-input norm.
+//! - `gpu_experts` and `combine`: launches only; their device time lands in the next blocking
+//!   span (`router` of the next layer, or `logits`) unless the mode is `Sync` or `Events`.
 
 use crate::Error;
 use crate::exec::{
     self, ExecConfig, Logits, MoeBuffers, MoePlan, Observer, emit, emit_selection, experts_cpu, select_experts,
 };
 use crate::hip::{self, AttnShape, DevBuf};
+use crate::instr::{Instr, Mode, Span};
 use crate::model::Weights;
 use crate::ops::{Q4_BLOCK, Q8_BLOCK, QK};
 
@@ -110,6 +124,74 @@ pub struct HipSession<'w, 'a> {
     n_past: usize,
     written: usize,
     device_bytes: usize,
+    probe: Option<Box<Probe>>,
+}
+
+/// Instrumentation state: the span accumulator plus, in `Mode::Events`, one device event per span
+/// boundary (allocated when enabled).
+#[derive(Debug)]
+struct Probe {
+    instr: Instr,
+    events: Vec<hip::Event>,
+    began: std::time::Instant,
+}
+
+/// Span boundaries per layer (at most) and per evaluation, which bound the event pool.
+const BOUNDS_PER_LAYER: usize = 9;
+const BOUNDS_PER_EVAL: usize = 3;
+
+impl Probe {
+    fn begin(&mut self, first: Span, layer: usize) -> Result<(), Error> {
+        let now = std::time::Instant::now();
+        self.began = now;
+        self.instr.begin(first, layer, now, hip::counters());
+        self.event()
+    }
+
+    fn mark(&mut self, next: Span, layer: usize) -> Result<(), Error> {
+        if self.instr.mode() == Mode::Sync {
+            hip::probe_sync()?;
+        }
+        self.instr.mark(next, layer, std::time::Instant::now(), hip::counters());
+        self.event()
+    }
+
+    /// Record the event for the boundary just opened.
+    fn event(&mut self) -> Result<(), Error> {
+        if self.instr.mode() == Mode::Events {
+            if let Some(e) = self.events.get(self.instr.bounds().len() - 1) {
+                e.record()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn end(&mut self) -> Result<(), Error> {
+        let n = self.instr.bounds().len();
+        if self.instr.mode() == Mode::Events && n < self.events.len() {
+            // Closing event; it follows the evaluation's final blocking call, so waiting is brief.
+            self.events[n].record()?;
+            self.events[n].wait()?;
+        } else if self.instr.mode() == Mode::Sync {
+            hip::probe_sync()?;
+        }
+        self.instr.end(std::time::Instant::now(), hip::counters(), self.began);
+        if self.instr.mode() == Mode::Events && n < self.events.len() {
+            for i in 0..n {
+                let ms = self.events[i].elapsed_ms(&self.events[i + 1])?;
+                self.instr.add_device(i, (f64::from(ms) * 1e6) as u64);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Mark a span boundary when instrumentation is enabled; otherwise nothing.
+fn mark(p: &mut Option<Box<Probe>>, next: Span, layer: usize) -> Result<(), Error> {
+    match p {
+        Some(p) => p.mark(next, layer),
+        None => Ok(()),
+    }
 }
 
 fn f32_buf(v: &[f32]) -> Result<DevBuf, Error> {
@@ -291,9 +373,47 @@ impl<'w, 'a> HipSession<'w, 'a> {
             n_past: 0,
             written: 0,
             device_bytes: need,
+            probe: None,
             w,
             cfg,
         })
+    }
+
+    /// Enable instrumentation in `mode`, or disable it with `None` (the default). Enabling
+    /// allocates the accumulator and, for `Mode::Events`, the event pool; evaluation then
+    /// allocates nothing. Re-enabling discards earlier measurements.
+    pub fn set_instrumentation(&mut self, mode: Option<Mode>) -> Result<(), Error> {
+        self.probe = None;
+        if let Some(mode) = mode {
+            let n_layers = self.layers.len();
+            let max_bounds = n_layers * BOUNDS_PER_LAYER + BOUNDS_PER_EVAL;
+            let events = if mode == Mode::Events {
+                (0..=max_bounds).map(|_| hip::Event::new()).collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
+            };
+            let now = std::time::Instant::now();
+            self.probe =
+                Some(Box::new(Probe { instr: Instr::new(mode, n_layers, max_bounds, now), events, began: now }));
+        }
+        Ok(())
+    }
+
+    /// Measurements so far, when instrumentation is enabled.
+    pub fn instrumentation(&self) -> Option<&Instr> {
+        self.probe.as_ref().map(|p| &p.instr)
+    }
+
+    /// Forget measurements so far (for example after prefill), keeping instrumentation enabled.
+    pub fn reset_instrumentation(&mut self) {
+        if let Some(p) = &mut self.probe {
+            p.instr.reset();
+        }
+    }
+
+    /// Whether layer `il` runs its routed experts on the CPU (for grouping reports).
+    pub fn host_expert_layer(&self, il: usize) -> bool {
+        self.layers.get(il).is_some_and(|l| l.experts.is_none())
     }
 
     pub fn n_past(&self) -> usize {
@@ -348,6 +468,10 @@ impl<'w, 'a> HipSession<'w, 'a> {
             return Err(Error::UnsupportedInput("token id out of range"));
         }
         let e = self.w.cfg.n_embd as usize;
+        let n_layers = self.layers.len();
+        if let Some(p) = &mut self.probe {
+            p.begin(Span::Embed, n_layers)?;
+        }
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         self.d.ids.upload(0, &ids)?;
         hip::get_rows_q4(self.tok_embd.at(0), vocab, self.d.ids.i(0), self.d.x.f(0), n, e, (e as f32).sqrt())?;
@@ -370,6 +494,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
             Logits::All => 0..n,
         };
         let n_out = rows.len();
+        mark(&mut self.probe, Span::Head, n_layers)?;
         if n_out > 0 {
             let c = &self.w.cfg;
             let d = &self.d;
@@ -380,9 +505,15 @@ impl<'w, 'a> HipSession<'w, 'a> {
             if c.final_logit_softcap != 0.0 {
                 hip::softcap(d.logits.f(0), n_out * vocab, c.final_logit_softcap)?;
             }
+            mark(&mut self.probe, Span::Logits, n_layers)?;
+            let d = &self.d;
             d.logits.download(0, &mut self.hs.logits[..n_out * vocab])?;
         } else {
+            mark(&mut self.probe, Span::Logits, n_layers)?;
             hip::sync()?;
+        }
+        if let Some(p) = &mut self.probe {
+            p.end()?;
         }
         self.n_past += n;
         self.written = self.written.max(self.n_past);
@@ -415,6 +546,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
         let p0 = self.n_past;
 
         // Attention.
+        mark(&mut self.probe, Span::Attn, il)?;
         hip::rms_norm(d.x.f(0), d.cur.f(0), Some(dl.attn_norm.f(0)), n, e, eps, 1.0)?;
         self.emit_dev(obs, "attn_norm", ilg, &d.cur, n * e)?;
         hip::q4_mm(dl.wq.at(0), d.cur.f(0), d.q.f(0), qd, e, n)?;
@@ -451,6 +583,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
 
         // Shared MLP into `cur`.
         let ffd = c.ff_dense as usize;
+        mark(&mut self.probe, Span::Mlp, il)?;
         hip::rms_norm(d.o.f(0), d.cur.f(0), Some(dl.ffn_norm.f(0)), n, e, eps, 1.0)?;
         hip::q4_mm(dl.ffn_gate.at(0), d.cur.f(0), d.gate.f(0), ffd, e, n)?;
         hip::q4_mm(dl.ffn_up.at(0), d.cur.f(0), d.up.f(0), ffd, e, n)?;
@@ -464,14 +597,17 @@ impl<'w, 'a> HipSession<'w, 'a> {
         let used = c.n_experts_used as usize;
         let fe = c.ff_expert as usize;
         let inv_sqrt = 1.0 / (e as f32).sqrt();
+        mark(&mut self.probe, Span::Router, il)?;
         hip::rms_norm(d.o.f(0), d.router_x.f(0), Some(dl.gate_inp_scale.f(0)), n, e, eps, inv_sqrt)?;
         hip::f32_mm(dl.gate_inp.f(0), d.router_x.f(0), d.router_logits.f(0), ne, e, n)?;
         let rl = &mut self.hs.router_logits[..n * ne];
         d.router_logits.download(0, rl)?;
+        mark(&mut self.probe, Span::Select, il)?;
         emit(obs, "ffn_moe_logits", ilg, rl);
         let sel = select_experts(rl, ne, used);
         emit_selection(obs, ilg, &sel);
         let plan = MoePlan::new(&sel, n, used);
+        mark(&mut self.probe, Span::ExpIn, il)?;
         hip::rms_norm(d.o.f(0), d.moe_in.f(0), Some(dl.pre_ffw_norm_2.f(0)), n, e, eps, 1.0)?;
 
         let pairs = n * used;
@@ -480,11 +616,14 @@ impl<'w, 'a> HipSession<'w, 'a> {
                 // Static CPU placement: experts run on the host from host-resident weights.
                 let hs = &mut self.hs;
                 d.moe_in.download(0, &mut hs.moe_in[..n * e])?;
+                mark(&mut self.probe, Span::CpuExperts, il)?;
                 let buf = MoeBuffers { x: &mut hs.mx, gu: &mut hs.gu, h: &mut hs.h, y: &mut hs.y };
                 experts_cpu(l, e, fe, self.cfg.exec.threads, &hs.moe_in[..n * e], &plan, buf, &mut hs.moe_out[..n * e]);
+                mark(&mut self.probe, Span::ExpOut, il)?;
                 d.moe.upload(0, &hs.moe_out[..n * e])?;
             }
             Some((gu_w, dn_w)) => {
+                mark(&mut self.probe, Span::ExpMeta, il)?;
                 let idx: Vec<i32> = plan.order.iter().map(|&i| (i / used) as i32).collect();
                 let pos: Vec<i32> = plan.pos_of.iter().map(|&k| k as i32).collect();
                 let scale: Vec<f32> = plan.sel.iter().map(|&(ex, _)| l.down_exps_scale[ex]).collect();
@@ -493,6 +632,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
                 d.pos.upload(0, &pos)?;
                 d.scale.upload(0, &scale)?;
                 d.weight.upload(0, &weight)?;
+                mark(&mut self.probe, Span::GpuExperts, il)?;
                 hip::gather_rows(d.moe_in.f(0), n, d.idx.i(0), d.mx.f(0), pairs, e)?;
                 let gu_rows = 2 * fe;
                 let gu_bytes = gu_rows * (e / QK * Q4_BLOCK);
@@ -507,6 +647,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
                 hip::moe_combine(d.y.f(0), pairs, d.pos.i(0), d.scale.f(0), d.weight.f(0), d.moe.f(0), n, used, e)?;
             }
         }
+        mark(&mut self.probe, Span::Combine, il)?;
         hip::rms_norm(d.moe.f(0), d.moe.f(0), Some(dl.post_ffw_norm_2.f(0)), n, e, eps, 1.0)?;
         self.emit_dev(obs, "ffn_moe", ilg, &d.moe, n * e)?;
 

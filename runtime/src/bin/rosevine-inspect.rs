@@ -7,7 +7,8 @@
 //! rosevine-inspect prepare  <gguf>                  # stdin: request blocks, see `read_request`
 //! rosevine-inspect kld      <gguf> --base <llama-perplexity logits file> [--chunks N] [--batch B] [--threads T]
 //! rosevine-inspect dump     <gguf> --out <dir> [--logits-tail K] [--no-observe] [--debug-no-swa]  # stdin: token ids
-//! rosevine-inspect generate <gguf> --n <steps> [--batch B] [--threads T] [--ctx C]  # stdin: prompt token ids
+//! rosevine-inspect generate <gguf> --n <steps> [--batch B] [--threads T] [--ctx C] [--instr host|sync|events]
+//!                                                     # stdin: prompt token ids
 //! ```
 //!
 //! `kld`, `generate` and `dump` take `--backend cpu|hip` (hip needs the `hip` feature) with
@@ -205,6 +206,37 @@ impl<'w, 'a> Exec<'w, 'a> {
         }
     }
 
+    /// `--instr host|sync|events` (HIP only): instrument the decode steps that follow (R3a.1).
+    fn instrument(&mut self, args: &[String]) -> Result<(), Error> {
+        let Some(m) = opt::<String>(args, "--instr") else { return Ok(()) };
+        let mode = rosevine_runtime::instr::Mode::parse(&m).ok_or(Error::UnsupportedInput("unknown --instr mode"))?;
+        match self {
+            Exec::Cpu(_) => {
+                let _ = mode;
+                Err(Error::UnsupportedInput("--instr needs --backend hip"))
+            }
+            #[cfg(feature = "hip")]
+            Exec::Hip(s) => s.set_instrumentation(Some(mode)),
+        }
+    }
+
+    /// Print the instrumentation summary (timings and counts only) to stderr.
+    fn report_instrumentation(&self, loop_s: f64) {
+        #[cfg(feature = "hip")]
+        if let Exec::Hip(s) = self {
+            if let Some(i) = s.instrumentation() {
+                let group = |l: usize| if s.host_expert_layer(l) { "host" } else { "gpu" };
+                eprintln!(
+                    "decode_loop_ms={:.3} loop_closure={:.4}",
+                    loop_s * 1e3,
+                    i.total().host_ns as f64 / 1e9 / loop_s
+                );
+                eprint!("{}", i.summary(&group));
+            }
+        }
+        let _ = loop_s;
+    }
+
     fn reset(&mut self) {
         match self {
             Exec::Cpu(s) => s.reset(),
@@ -394,6 +426,7 @@ fn generate(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error
         }
     }
     let prefill_s = t0.elapsed().as_secs_f64();
+    sess.instrument(args)?;
     let mut ids = vec![next];
     let t1 = Instant::now();
     for _ in 1..steps {
@@ -402,6 +435,7 @@ fn generate(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error
         ids.push(next);
     }
     let dec = t1.elapsed().as_secs_f64();
+    sess.report_instrumentation(dec);
     writeln!(out, "generated {}", ids_str(&ids)).ok();
     writeln!(
         out,

@@ -340,6 +340,31 @@ int rvh_sync(void) { return (int)hipDeviceSynchronize(); }
 
 const char *rvh_error_string(int code) { return hipGetErrorString((hipError_t)code); }
 
+int rvh_event_create(void **out) {
+    if (!out) return (int)hipErrorInvalidValue;
+    hipEvent_t e = nullptr;
+    hipError_t r = hipEventCreate(&e);
+    *out = (void *)e;
+    return (int)r;
+}
+
+int rvh_event_destroy(void *ev) { return ev ? (int)hipEventDestroy((hipEvent_t)ev) : 0; }
+
+int rvh_event_record(void *ev) {
+    if (!ev) return (int)hipErrorInvalidValue;
+    return (int)hipEventRecord((hipEvent_t)ev, 0);
+}
+
+int rvh_event_sync(void *ev) {
+    if (!ev) return (int)hipErrorInvalidValue;
+    return (int)hipEventSynchronize((hipEvent_t)ev);
+}
+
+int rvh_event_elapsed(void *start, void *end, float *ms) {
+    if (!start || !end || !ms) return (int)hipErrorInvalidValue;
+    return (int)hipEventElapsedTime(ms, (hipEvent_t)start, (hipEvent_t)end);
+}
+
 #define CHECK_DIMS(cond) \
     do {                 \
         if (!(cond)) return (int)hipErrorInvalidValue; \

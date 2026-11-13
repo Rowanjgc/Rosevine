@@ -29,6 +29,14 @@ int rvh_copy(void *dst, const void *src, size_t bytes); /* device to device, ord
 int rvh_sync(void);
 const char *rvh_error_string(int code);
 
+/* Timing events for instrumentation (R3a.1). Recorded on the null stream; elapsed time in ms
+ * between two completed events. Additive to the R2 ABI. */
+int rvh_event_create(void **out);
+int rvh_event_destroy(void *ev);
+int rvh_event_record(void *ev);
+int rvh_event_sync(void *ev);
+int rvh_event_elapsed(void *start, void *end, float *ms);
+
 /* out[t] = dequant(w row ids[t]) * scale, k wide. */
 int rvh_get_rows_q4(const void *w, const int32_t *ids, float *out, int n, int k, float scale);
 /* out[r] = ((x[r] * rms_scale) * post) * weight (weight may be NULL), rows of `width`. In place allowed. */

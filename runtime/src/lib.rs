@@ -18,6 +18,7 @@ pub mod hip;
 #[cfg(feature = "hip")]
 pub mod hip_exec;
 pub mod input;
+pub mod instr;
 pub mod mmap;
 pub mod model;
 pub mod ops;

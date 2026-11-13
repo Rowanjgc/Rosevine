@@ -4,8 +4,13 @@
 //! ([`F`] for f32, [`I`] for i32, [`B`] for bytes) and check every range a kernel reads or writes
 //! against the owning allocation before calling it, because the C side validates only scalars.
 //! All work runs in order on the null stream; downloads synchronize.
+//!
+//! Every wrapper also counts its call in per-thread [`Counters`] (R3a.1). Counting is a
+//! thread-local add and is always on; only the instrumentation probe reads it.
 
 use crate::Error;
+use crate::instr::Counters;
+use std::cell::Cell;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
 
@@ -22,6 +27,11 @@ mod ffi {
         pub fn rvh_copy(dst: *mut c_void, src: *const c_void, bytes: usize) -> c_int;
         pub fn rvh_sync() -> c_int;
         pub fn rvh_error_string(code: c_int) -> *const c_char;
+        pub fn rvh_event_create(out: *mut *mut c_void) -> c_int;
+        pub fn rvh_event_destroy(ev: *mut c_void) -> c_int;
+        pub fn rvh_event_record(ev: *mut c_void) -> c_int;
+        pub fn rvh_event_sync(ev: *mut c_void) -> c_int;
+        pub fn rvh_event_elapsed(start: *mut c_void, end: *mut c_void, ms: *mut f32) -> c_int;
         pub fn rvh_get_rows_q4(w: *const c_void, ids: *const i32, out: *mut f32, n: c_int, k: c_int, s: f32) -> c_int;
         pub fn rvh_rms_norm(
             x: *const f32,
@@ -125,8 +135,82 @@ pub fn mem_info() -> Result<(usize, usize), Error> {
 
 /// Wait for all queued device work.
 pub fn sync() -> Result<(), Error> {
+    bump(|c| c.syncs += 1);
     // SAFETY: no arguments.
     check(unsafe { ffi::rvh_sync() })
+}
+
+/// A sync made by the instrumentation probe (counted apart from the executor's own).
+pub fn probe_sync() -> Result<(), Error> {
+    bump(|c| c.probe_calls += 1);
+    // SAFETY: no arguments.
+    check(unsafe { ffi::rvh_sync() })
+}
+
+thread_local! {
+    static COUNTERS: Cell<Counters> = const { Cell::new(Counters::ZERO) };
+}
+
+fn bump(f: impl FnOnce(&mut Counters)) {
+    COUNTERS.with(|c| {
+        let mut v = c.get();
+        f(&mut v);
+        c.set(v);
+    });
+}
+
+/// Device calls made so far by this thread (monotonic; diff two readings).
+pub fn counters() -> Counters {
+    COUNTERS.with(Cell::get)
+}
+
+fn launched(code: c_int) -> Result<(), Error> {
+    bump(|c| c.launches += 1);
+    check(code)
+}
+
+/// A device timing event (instrumentation only), destroyed on drop.
+#[derive(Debug)]
+pub struct Event {
+    ptr: *mut c_void,
+}
+
+impl Event {
+    pub fn new() -> Result<Self, Error> {
+        let mut p = ptr::null_mut();
+        // SAFETY: `p` is a valid out-pointer; on success it owns one event.
+        check(unsafe { ffi::rvh_event_create(&mut p) })?;
+        Ok(Event { ptr: p })
+    }
+
+    /// Record on the null stream, after all work queued so far.
+    pub fn record(&self) -> Result<(), Error> {
+        bump(|c| c.probe_calls += 1);
+        // SAFETY: `ptr` is a live event owned by self.
+        check(unsafe { ffi::rvh_event_record(self.ptr) })
+    }
+
+    /// Wait until the event has completed.
+    pub fn wait(&self) -> Result<(), Error> {
+        bump(|c| c.probe_calls += 1);
+        // SAFETY: `ptr` is a live event owned by self.
+        check(unsafe { ffi::rvh_event_sync(self.ptr) })
+    }
+
+    /// Milliseconds from `self` to `later`; both must have completed.
+    pub fn elapsed_ms(&self, later: &Event) -> Result<f32, Error> {
+        let mut ms = 0.0f32;
+        // SAFETY: both events are live; `ms` is a valid out-pointer.
+        check(unsafe { ffi::rvh_event_elapsed(self.ptr, later.ptr, &mut ms) })?;
+        Ok(ms)
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` came from rvh_event_create and is destroyed exactly once, here.
+        let _ = unsafe { ffi::rvh_event_destroy(self.ptr) };
+    }
 }
 
 /// Plain data that may be copied bytewise to and from the device.
@@ -165,6 +249,10 @@ impl DevBuf {
     pub fn upload<T: Plain>(&self, off: usize, data: &[T]) -> Result<(), Error> {
         let n = std::mem::size_of_val(data);
         let dst = self.range(off, n)?;
+        bump(|c| {
+            c.h2d += 1;
+            c.h2d_bytes += n as u64;
+        });
         // SAFETY: `dst..dst+n` is inside this allocation (checked); `data` is valid for `n` bytes.
         check(unsafe { ffi::rvh_upload(dst, data.as_ptr().cast(), n) })
     }
@@ -173,6 +261,10 @@ impl DevBuf {
     pub fn download<T: Plain>(&self, off: usize, out: &mut [T]) -> Result<(), Error> {
         let n = std::mem::size_of_val(out);
         let src = self.range(off, n)?;
+        bump(|c| {
+            c.d2h += 1;
+            c.d2h_bytes += n as u64;
+        });
         // SAFETY: `src..src+n` is inside this allocation (checked); `out` is valid for `n` byte writes,
         // and any bit pattern is a valid `Plain` value.
         check(unsafe { ffi::rvh_download(out.as_mut_ptr().cast(), src, n) })
@@ -245,6 +337,7 @@ const Q8_ROW: fn(usize) -> usize = |k| k / 32 * 34;
 /// Device-to-device copy of `n` f32 values.
 pub fn copy(dst: F, src: F, n: usize) -> Result<(), Error> {
     let (d, s) = (dst.p(n)?, src.p(n)?);
+    bump(|c| c.d2d += 1);
     // SAFETY: both ranges checked against their allocations.
     check(unsafe { ffi::rvh_copy(d.cast(), s.cast(), n * 4) })
 }
@@ -252,7 +345,7 @@ pub fn copy(dst: F, src: F, n: usize) -> Result<(), Error> {
 pub fn get_rows_q4(w: B, n_rows_w: usize, ids: I, out: F, n: usize, k: usize, scale: f32) -> Result<(), Error> {
     let (wp, ip, op) = (w.p(n_rows_w * Q4_ROW(k))?, ids.p(n)?, out.p(n * k)?);
     // SAFETY: ranges checked; ids must be < n_rows_w, which the caller validates on the host.
-    check(unsafe { ffi::rvh_get_rows_q4(wp, ip, op, int(n)?, int(k)?, scale) })
+    launched(unsafe { ffi::rvh_get_rows_q4(wp, ip, op, int(n)?, int(k)?, scale) })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -260,19 +353,19 @@ pub fn rms_norm(x: F, out: F, w: Option<F>, rows: usize, width: usize, eps: f32,
     let n = rows * width;
     let (xp, op, wp) = (x.p(n)?, out.p(n)?, opt_f(w, width)?);
     // SAFETY: all ranges checked against their allocations.
-    check(unsafe { ffi::rvh_rms_norm(xp, op, wp, int(rows)?, int(width)?, eps, post) })
+    launched(unsafe { ffi::rvh_rms_norm(xp, op, wp, int(rows)?, int(width)?, eps, post) })
 }
 
 pub fn q4_mm(w: B, x: F, y: F, n_out: usize, k: usize, n_in: usize) -> Result<(), Error> {
     let (wp, xp, yp) = (w.p(n_out * Q4_ROW(k))?, x.p(n_in * k)?, y.p(n_in * n_out)?);
     // SAFETY: all ranges checked against their allocations.
-    check(unsafe { ffi::rvh_q4_mm(wp, xp, yp, int(n_out)?, int(k)?, int(n_in)?) })
+    launched(unsafe { ffi::rvh_q4_mm(wp, xp, yp, int(n_out)?, int(k)?, int(n_in)?) })
 }
 
 pub fn f32_mm(w: F, x: F, y: F, n_out: usize, k: usize, n_in: usize) -> Result<(), Error> {
     let (wp, xp, yp) = (w.p(n_out * k)?, x.p(n_in * k)?, y.p(n_in * n_out)?);
     // SAFETY: all ranges checked against their allocations.
-    check(unsafe { ffi::rvh_f32_mm(wp, xp, yp, int(n_out)?, int(k)?, int(n_in)?) })
+    launched(unsafe { ffi::rvh_f32_mm(wp, xp, yp, int(n_out)?, int(k)?, int(n_in)?) })
 }
 
 /// RMS-norm each head (optional weight), then NEOX RoPE at `p0 + t` when `rope` is given.
@@ -294,7 +387,7 @@ pub fn head_norm_rope(
         None => (0.0, ptr::null()),
     };
     // SAFETY: all ranges checked against their allocations.
-    check(unsafe { ffi::rvh_head_norm_rope(xp, int(n_tok)?, int(n_heads)?, int(hd)?, wp, eps, int(p0)?, base, ff) })
+    launched(unsafe { ffi::rvh_head_norm_rope(xp, int(n_tok)?, int(n_heads)?, int(hd)?, wp, eps, int(p0)?, base, ff) })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -313,7 +406,7 @@ pub fn kv_store(
     let c = cap * n_kv * Q8_ROW(hd);
     let (kp, vp, kcp, vcp) = (k.p(n)?, v.p(n)?, kc.p(c)?, vc.p(c)?);
     // SAFETY: inputs and both whole caches checked; slots are taken modulo `cap`.
-    check(unsafe { ffi::rvh_kv_store(kp, vp, kcp, vcp, int(n_tok)?, int(n_kv)?, int(hd)?, int(p0)?, int(cap)?) })
+    launched(unsafe { ffi::rvh_kv_store(kp, vp, kcp, vcp, int(n_tok)?, int(n_kv)?, int(hd)?, int(p0)?, int(cap)?) })
 }
 
 /// Attention geometry for [`attention`].
@@ -335,7 +428,7 @@ pub fn attention(q: F, kc: B, vc: B, out: F, scores: F, s: AttnShape) -> Result<
     let c = s.cap * s.n_kv * Q8_ROW(s.hd);
     let (qp, kp, vp, op, sp) = (q.p(nq)?, kc.p(c)?, vc.p(c)?, out.p(nq)?, scores.p(s.n_tok * s.n_head * s.max_keys)?);
     // SAFETY: all ranges checked; the C side checks each query's key count against max_keys and cap.
-    check(unsafe {
+    launched(unsafe {
         ffi::rvh_attention(
             qp,
             kp,
@@ -357,32 +450,32 @@ pub fn attention(q: F, kc: B, vc: B, out: F, scores: F, s: AttnShape) -> Result<
 pub fn geglu(g: F, u: F, out: F, n: usize) -> Result<(), Error> {
     let (gp, up, op) = (g.p(n)?, u.p(n)?, out.p(n)?);
     // SAFETY: all ranges checked against their allocations.
-    check(unsafe { ffi::rvh_geglu(gp, up, op, int(n)?) })
+    launched(unsafe { ffi::rvh_geglu(gp, up, op, int(n)?) })
 }
 
 pub fn geglu_split(gu: F, out: F, rows: usize, ff: usize) -> Result<(), Error> {
     let (gp, op) = (gu.p(rows * 2 * ff)?, out.p(rows * ff)?);
     // SAFETY: all ranges checked against their allocations.
-    check(unsafe { ffi::rvh_geglu_split(gp, op, int(rows)?, int(ff)?) })
+    launched(unsafe { ffi::rvh_geglu_split(gp, op, int(rows)?, int(ff)?) })
 }
 
 pub fn add(a: F, b: F, out: F, n: usize) -> Result<(), Error> {
     let (ap, bp, op) = (a.p(n)?, b.p(n)?, out.p(n)?);
     // SAFETY: all ranges checked against their allocations.
-    check(unsafe { ffi::rvh_add(ap, bp, op, int(n)?) })
+    launched(unsafe { ffi::rvh_add(ap, bp, op, int(n)?) })
 }
 
 pub fn add_scale(x: F, r: F, s: f32, n: usize) -> Result<(), Error> {
     let (xp, rp) = (x.p(n)?, r.p(n)?);
     // SAFETY: all ranges checked against their allocations.
-    check(unsafe { ffi::rvh_add_scale(xp, rp, s, int(n)?) })
+    launched(unsafe { ffi::rvh_add_scale(xp, rp, s, int(n)?) })
 }
 
 /// `dst[i] = src[idx[i]]`; `src_rows` bounds the indices, which the caller validates on the host.
 pub fn gather_rows(src: F, src_rows: usize, idx: I, dst: F, n: usize, width: usize) -> Result<(), Error> {
     let (sp, ip, dp) = (src.p(src_rows * width)?, idx.p(n)?, dst.p(n * width)?);
     // SAFETY: ranges checked; indices < src_rows by the caller's contract.
-    check(unsafe { ffi::rvh_gather_rows(sp, ip, dp, int(n)?, int(width)?) })
+    launched(unsafe { ffi::rvh_gather_rows(sp, ip, dp, int(n)?, int(width)?) })
 }
 
 /// `out[t] = sum_j (y[pos[p]] * scale[p]) * weight[p]` over `y_rows` rows of `width`.
@@ -402,11 +495,11 @@ pub fn moe_combine(
     let (yp, pp, sp, wp, op) =
         (y.p(y_rows * width)?, pos.p(pairs)?, scale.p(pairs)?, weight.p(pairs)?, out.p(n_tok * width)?);
     // SAFETY: ranges checked; pos values < y_rows by the caller's contract.
-    check(unsafe { ffi::rvh_moe_combine(yp, pp, sp, wp, op, int(n_tok)?, int(used)?, int(width)?) })
+    launched(unsafe { ffi::rvh_moe_combine(yp, pp, sp, wp, op, int(n_tok)?, int(used)?, int(width)?) })
 }
 
 pub fn softcap(x: F, n: usize, cap: f32) -> Result<(), Error> {
     let xp = x.p(n)?;
     // SAFETY: range checked against its allocation.
-    check(unsafe { ffi::rvh_softcap(xp, int(n)?, cap) })
+    launched(unsafe { ffi::rvh_softcap(xp, int(n)?, cap) })
 }
