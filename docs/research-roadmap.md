@@ -18,6 +18,14 @@ B3 remains deferred pending reference/safety follow-up and an updated gate outco
 The initial counts, ready set and future-work statements below describe the
 planning snapshot; local Beads are authoritative for current issue status.
 
+## Optimization architecture proposal
+
+A proposed expansion, 2026-11-13, adds an [optimization research report](optimization-research.md),
+a [framework](optimization-framework.md), [ADR 0002 (Proposed)](adr/0002-expert-residency-and-scheduling.md),
+a [validation plan](optimization-validation.md) and a [roadmap proposal](optimization-roadmap.md).
+The maintainer approved the direction on 2026-11-13. Gate 3 is now GO, scoped,
+and only the R3a Beads were installed.
+
 ## Storage and execution policy
 
 The current direct handoff authorizes the research phase and repository-local
@@ -90,8 +98,12 @@ Detailed criteria are maintained in Beads, with shared definitions in the
 | G2 | rv-e03-mmf.4 | Gate 2 backend/runtime ADR and human decision | C1, C2, C3 |
 | R1 | rv-e04-398.1 | Done: validated GGUF/mmap/tokenizer and text/modality input boundary ([R1](runtime-r1-contract.md)) | G2, H2, B2 |
 | R2 | rv-e04-398.2 | Done: CPU and HIP target-only executors, static first-N placement, Q8_0 KV ([R2](runtime-r2-execution.md)) | R1 |
-| G3 | rv-e04-398.3 | Gate 3 target-only reference correctness | R2, B2 |
-| K1 | rv-e05-7n3.1 | Critical-path attribution, counters/timestamps and ranked hypotheses | G3, S1 |
+| G3 | rv-e04-398.3 | Done: Gate 3 GO, scoped ([review](gate-3-review.md)) | R2, B2 |
+| R3a.1 | rv-e05-7n3.5 | Instrument the HIP decode path ([optimization roadmap](optimization-roadmap.md)) | G3 |
+| R3a.2 | rv-e05-7n3.6 | Attribute the target-only decode critical path; now blocks K1 | R3a.1 |
+| R3a.3 | rv-e06-k0i.5 | Persistent CPU pool and SIMD f32 Q4_0 expert kernel | R3a.1 |
+| R3a.4 | rv-e06-k0i.6 | Experimental Q8_0-activation CPU expert variant | R3a.3 |
+| K1 | rv-e05-7n3.1 | Critical-path attribution, counters/timestamps and ranked hypotheses | G3, S1, R3a.2 |
 | K2 | rv-e05-7n3.2 | Deferred: Q4_0 GEMV/GEMM, unpack/packing and integrated benefit test | K1 |
 | K3 | rv-e05-7n3.3 | Deferred: local/global attention, norm/GELU fusion, graphs and scratch/scheduling | K1 |
 | G4 | rv-e05-7n3.4 | Gate 4 specialization benefit or negative-result review | K2, K3 |
@@ -112,7 +124,7 @@ Detailed criteria are maintained in Beads, with shared definitions in the
 
 ## Decision gates
 
-No gate has passed. A gate report records outcome, evidence/versions, limitations,
+Gates 0–3 have recorded outcomes (see their review documents). A gate report records outcome, evidence/versions, limitations,
 review and the next discriminating action. Accepted ADRs require explicit human
 review; a plan document cannot accept its own proposed architecture.
 
