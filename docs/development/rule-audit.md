@@ -94,3 +94,22 @@ to resolve it may proceed within their authorized profile. Neither successful
 loading nor this policy revision supplies correctness, repeatability, source
 equivalence or an optimization GO. Never replace those evidence requirements with
 a successful smoke test.
+
+## GPU baseline revision (2026-11-12)
+
+Revised at the maintainer's request after live GPU sessions showed the earlier
+stops cancelling routine work that the production router performs daily without
+any guardrails. This supersedes the GPU thermal values and display reserve above
+for reference-server sessions run by [gpu_campaign.py](../../scripts/gpu_campaign.py).
+
+| Rule | Previous behaviour | Current rule and reason |
+| --- | --- | --- |
+| GPU/CPU thermal | Any single sample at 75/85 °C (GPU) or 90 °C (CPU) cancelled the run | Hard stop only near firmware limits and only when sustained for 0.5 s: GPU junction 105, memory 103, edge 95 °C (driver critical 110/108/100); CPU Tctl and CCD 100 °C. The CPU stop indicates failed regulation: this Zen 4 CPU boosts until it reaches its 95 °C limit and holds there under sustained multi-core load (observed within 3–5 s at 4 and 6 threads), so 95 °C is its normal loaded operating point and is recorded as a flag. The old values become per-request data-quality flags (CPU flag 95 °C). Single-sample die-sensor spikes (a 91.9 °C and a 95.6 °C CCD reading while Tctl stayed near 72–76 °C) stopped two preset sessions without indicating sustained heat. |
+| Thermal data quality | Implicit in the stop | Each measured request records maximum temperatures, sustained time over its flag value and median shader clock. Analyses report results with and without flagged requests instead of discarding them silently. |
+| Free-VRAM reserve | Stop when free VRAM fell below 1 GiB, later 256 MiB | Disabled for reference-server sessions. The fast/default/128k presets run in production with about 0.3 GiB free. Allocation failure ends the session in the server, and growth of any foreign `llama-server` process (production router or its sleeping model children) still cancels the session immediately. |
+| Collector cycle cost | 1 ms p95 host-cycle target | Informational. A paired end-to-end test measured the collector's effect on decode rate at +0.07% (95% CI −0.14% to +0.13%), which is the quantity the target was meant to protect. |
+
+Unchanged: router protection, RAM reserve and sustained-paging stop, disk reserve,
+confirmed process cleanup, one attempt per session with retained failures, and
+all privacy, publication and remote-write controls. Throttling or thermal flags
+limit the claims made from affected requests; they do not invalidate other data.

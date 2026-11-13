@@ -101,3 +101,42 @@ experiments. The only directly dependent experiment, B3, must remain deferred.
 Future GO requires updated evidence, a validated run envelope and the applicable
 human run-window approval. The candidate reference proposal remains unaccepted
 for performance execution.
+
+## Updated outcome 2026-11-12: GO (restricted)
+
+Outcome: GO for text-only Vulkan reference baselines (B3) within the envelope below.
+Reviewer: agent evidence review; GPU run window, VRAM reserve and thermal stops
+approved by the maintainer on 2026-11-12. No ADR, backend or runtime is adopted.
+
+| Readiness item | Evidence | Assessment |
+| --- | --- | --- |
+| Run tooling | [gpu_campaign.py](../scripts/gpu_campaign.py): private `llama-server` per session on a UNIX socket (no TCP port, production router untouched), token-exact greedy `/completion` requests, separate model-load deadline, synthetic tests | Ready |
+| Identity | Target, MTP assistant, projector, server binary and Vulkan/llama libraries re-hashed at campaign start; target/assistant/projector match Epic 1 | Local identities fixed; upstream lineage and source-build equivalence remain scope limits |
+| GPU smoke | Fast preset, 1900-token prompt: load 7.0 s, prefill 2256 tokens/s, 32-token decode 142.6 tokens/s, MTP 22/25 accepted, minimum free VRAM 0.52 GiB, confirmed cleanup | Allocation and execution work |
+| Cancellation | One run stopped on the VRAM reserve and one on the GPU-junction stop; both terminated the server and confirmed cleanup | Stops are live, not just tested synthetically |
+| Collector effect | Three ABBA pairs, 24 matched 512-token requests: decode rate +0.07% (95% CI −0.14% to +0.13%), wall time +0.01% (−0.11% to +0.08%) with 100 ms versus 1 s collection | Meets the ±1% paired criterion. Request-level bootstrap over only three independent session pairs |
+| Collector cycle cost | p95 round trip 9.8 ms (1484 cycles) | The 1 ms host-cycle target is still unmet. It is retained as a quality observation because the end-to-end effect it protects is measured directly above |
+
+Envelope approved by the maintainer after live findings (the thermal and VRAM
+items below were further revised the same day; see the
+[GPU baseline revision](development/rule-audit.md#gpu-baseline-revision-2026-11-12)):
+
+- Free-VRAM stop 256 MiB. The fast, default and 128k presets cannot keep 1 GiB
+  free: the installed fit tool needs ≥5 CPU MoE layers for a 1 GiB margin, and
+  explicit `--n-gpu-layers all` disables fitting.
+- GPU stops: junction 100 °C, memory 98 °C, edge 85 °C. The driver reports
+  110/108/100 °C critical. Normal decode drives junction to 82–85 °C within a
+  minute, so the earlier 85 °C stop cancelled routine sessions. CPU stops stay at 90 °C.
+- Always sample at 100 ms: 1 s sampling under-reported junction peaks by about
+  7 °C relative to 100 ms sessions.
+- RAM reserve 2 GiB; sustained-paging rule unchanged; disk reserve 2 GiB.
+- Any growth over 512 MiB in a foreign `llama-server` process (production router
+  or its sleeping model children) cancels the session. Sessions start only when
+  the GPU is idle and no foreign server holds a model.
+- One attempt per session, no automatic retry; failed attempts are retained.
+
+Scope limits carried into B3: text-only token-exact requests (chat rendering,
+reasoning parsing and router-only keys are not exercised); the configured
+projector is loaded as in the presets, plus one named text-only control;
+greedy decoding only; historical sampled-request overrides remain unknown.
+Downstream activation: B3 (rv-e02-22u.3) under the minimal Gate 1 scope.
