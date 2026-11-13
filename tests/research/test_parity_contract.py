@@ -22,7 +22,8 @@ def replay_text(engine, *, reps=2, n_prompt=4, n_decode=3, step_ns=50_000_000, e
         config.update(flash_attn='on', cpu_repack='on', swa_full=False, op_offload=True, buffers=[])
     config.update(extra or {})
     rows = [config] + [{'schema': P.REPLAY_SCHEMA, 'kind': 'rep', 'rep': i, 'prefill_ns': 400_000_000,
-                        'decode_ns': [step_ns] * n_decode} for i in range(reps)]
+                        'decode_ns': [step_ns] * n_decode, 'prefill_top1': 7, 'top1': [5] * n_decode}
+                       for i in range(reps)]
     return '\n'.join(json.dumps(r) for r in rows) + '\n'
 
 
@@ -42,7 +43,7 @@ def arms(cand_extra=None, ref_extra=None, ref_backend='vulkan'):
     return ref, cand
 
 
-CELL = {'id': 'x', 'family': 'engine', 'n_prompt': 4, 'n_decode': 3}
+CELL = {'id': 'x', 'phase': 'decode', 'family': 'engine', 'n_prompt': 4, 'n_decode': 3}
 
 
 class Matrix(unittest.TestCase):
@@ -85,6 +86,8 @@ class Adapters(unittest.TestCase):
             P.parse_replay(text.replace('[50000000, 50000000, 50000000]', '[50000000]', 1), engine='rosevine')
         with self.assertRaises(ValueError):
             P.parse_replay(text.replace('400000000', 'NaN', 1), engine='rosevine')
+        with self.assertRaises(ValueError):
+            P.parse_replay(text.replace('"top1": [5, 5, 5]', '"top1": [5]', 1), engine='rosevine')
 
     def test_llama_bench_is_random_token_only(self):
         rows = P.parse_llama_bench_json(json.dumps([{'n_prompt': 0, 'n_gen': 128, 'n_depth': 512,
@@ -132,6 +135,18 @@ class Pairing(unittest.TestCase):
             P.classify_pair(ref, cand, dict(CELL, n_prompt=512), 'vulkan')
         with self.assertRaises(ValueError):
             P.classify_pair(cand, ref, CELL, 'vulkan')
+
+    def test_prefill_cell_matches_prompt_only(self):
+        ref, cand = arms(cand_extra={'cpu_expert_activation': 'q8_0'})
+        prefill = {'id': 'p', 'phase': 'prefill', 'family': 'engine', 'n_prompt': 4, 'n_decode': 0}
+        self.assertEqual(P.classify_pair(ref, cand, prefill, 'vulkan')['class'], 'machinery_parity')
+        with self.assertRaises(ValueError):
+            P.classify_pair(ref, cand, dict(prefill, n_prompt=5), 'vulkan')
+
+    def test_top1_agreement(self):
+        self.assertEqual(P.top1_agreement([1, 2, 3, 4], [1, 2, 0, 4]), 0.75)
+        with self.assertRaises(ValueError):
+            P.top1_agreement([1], [1, 2])
 
     def test_reference_pin_must_match_series(self):
         ref, _ = arms()

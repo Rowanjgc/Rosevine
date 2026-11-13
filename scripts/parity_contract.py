@@ -158,7 +158,12 @@ def parse_replay(text, *, engine):
             raise ValueError('decode step count differs from config')
         for s in steps:
             _int(s, 'decode_ns', 1)
-        out.append({'prefill_tokens_per_s': n_prompt * 1e9 / prefill,
+        top1 = rep.get('top1')
+        if top1 is not None and (not isinstance(top1, list) or len(top1) != n_decode
+                                 or any(type(t) is not int or t < 0 for t in top1)):
+            raise ValueError('top-1 record differs from decode count')
+        out.append({'top1': top1, 'prefill_top1': rep.get('prefill_top1'),
+                    'prefill_tokens_per_s': n_prompt * 1e9 / prefill,
                     'decode_tokens_per_s': n_decode * 1e9 / sum(steps) if n_decode else None,
                     'decode_step_ms_median': statistics.median(steps) / 1e6 if n_decode else None})
     return {'config': config, 'repetitions': out}
@@ -251,6 +256,13 @@ def arm_from_replay(replay, **declared):
     return validate_arm(arm)
 
 
+def top1_agreement(a, b):
+    """Fraction of decode steps whose argmax ids agree; a correctness signal, not a speed one."""
+    if not a or a is None or b is None or len(a) != len(b):
+        raise ValueError('matched nonempty top-1 records required')
+    return sum(x == y for x, y in zip(a, b)) / len(a)
+
+
 def classify_pair(reference, candidate, cell, baseline):
     """Reject incompatible pairs; otherwise label machinery parity or practical comparison."""
     validate_arm(reference)
@@ -263,7 +275,10 @@ def classify_pair(reference, candidate, cell, baseline):
         raise ValueError('Rosevine candidate runs HIP under ADR 0001')
     if cell['family'] != reference['timing_family']:
         raise ValueError('cell timing family differs from arms')
-    if (cell['n_prompt'], cell['n_decode']) != (reference['n_prompt'], reference['n_decode']):
+    # Prefill timing closes before any decode step, so a prefill cell needs only P to match;
+    # decode and TTFT cells need both P and D.
+    wanted = (cell['n_prompt'],) if cell['phase'] == 'prefill' else (cell['n_prompt'], cell['n_decode'])
+    if wanted != (reference['n_prompt'], reference['n_decode'])[:len(wanted)]:
         raise ValueError('arms do not run this cell workload')
     if reference['fixture_sha256'] == 'random-token':
         raise ValueError('random-token llama-bench data cannot pair with a frozen fixture')
