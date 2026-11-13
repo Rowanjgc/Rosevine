@@ -1,8 +1,9 @@
 # 0001: Primary backend and runtime strategy
 
-Status: Proposed
+Status: Accepted
 Date: 2026-11-13
-Human acceptance: pending
+Human acceptance: maintainer, 2026-11-13, at Gate 2 review (option "HIP + Rust host").
+PR: not yet opened; local branch `research/epic-3-c3`.
 Supersedes: none
 
 ## Context and problem
@@ -118,7 +119,7 @@ exist to answer. The correctness and coverage evidence does not force it.
 
 ## Decision
 
-Proposed. It takes effect only after human acceptance.
+Accepted by the maintainer on 2026-11-13 as proposed, including the Rust host.
 
 1. **Primary backend: HIP (option A)** on Fedora ROCm 6.4. Kernels are compiled
    ahead of time for native gfx1101. This is the reference path for Gate 3.

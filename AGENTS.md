@@ -4,7 +4,8 @@
 
 Rosevine researches specialized inference for Gemma 4 26B A4B QAT on an RX 7800 XT.
 It does not replace the production llama.cpp router. Preserve GPL-3.0.
-Runtime language, ROCm versus Vulkan, kernel compilation, model representation and
+[ADR 0001](docs/adr/0001-primary-backend-and-runtime-strategy.md) chose HIP as the primary
+backend and a Rust host over a C ABI. Kernel specialization, model representation and
 expert memory placement remain undecided. Do not present hypotheses as findings.
 
 ## Authority

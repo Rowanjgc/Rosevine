@@ -2,9 +2,9 @@
 
 Date: 2026-11-13
 Bead: rv-e03-mmf.4
-Status: Evidence complete. ADR awaiting human review.
-Outcome: pending human acceptance of [ADR 0001](adr/0001-primary-backend-and-runtime-strategy.md)
-Reviewer: agent evidence review. The ADR decision is the maintainer's.
+Status: Reviewed
+Outcome: **GO.** [ADR 0001](adr/0001-primary-backend-and-runtime-strategy.md) accepted
+Reviewer: agent evidence review; the maintainer accepted ADR 0001 on 2026-11-13.
 
 ## GO condition check
 
@@ -19,7 +19,7 @@ human-accepted runtime ADR.
 | Paired full-model evidence: prefill, target-only, MTP, MoE | Met | 8 ABBA sessions per backend for the phase matrix; 8 per backend for MTP; MoE op timings (C1/C2) |
 | Compilation, tooling and complexity | Met | Registers and spills, startup, subgroup test (C1/C2); Triton compile and ISA, and C++/Rust/Python FFI (C3) |
 | Unsupported or failed cells | Recorded | No hardware profiler on either backend; rocBLAS not timed separately; one placement; Vulkan host-language cost not measured |
-| Human-accepted ADR | **Pending** | ADR 0001 is Proposed |
+| Human-accepted ADR | Met | ADR 0001 accepted by the maintainer, 2026-11-13 |
 
 ## Evidence trace
 
@@ -35,6 +35,18 @@ references.
 
 ## Outcome
 
-To be recorded after review: GO with ADR 0001 accepted (and its host-language
-choice), or NO-GO/PIVOT with the reason. A GO does not by itself start R1
-(rv-e04-398.1).
+**GO.** The maintainer accepted ADR 0001 as proposed:
+- HIP is the primary backend for the Gate 3 reference runtime;
+- the host is Rust, calling HIP C++ kernels through a narrow C ABI;
+- the pinned llama.cpp Vulkan reference is the performance baseline and fallback,
+  with no hybrid;
+- Triton is an offline kernel generator only;
+- Python is for automation only.
+
+This GO does not start R1 (rv-e04-398.1) by itself. Runtime implementation needs
+its own go-ahead.
+
+**Next discriminating actions:**
+- R1/R2 toward Gate 3, once authorized;
+- check that rocprofv3 works on gfx1101 before K1 (installing it needs approval);
+- the parallel tracks M1, M2 and S1.
