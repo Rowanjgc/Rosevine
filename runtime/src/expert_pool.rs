@@ -5,7 +5,11 @@
 //! or caller unwind before the borrowed slices may expire. Worker panics are
 //! caught, cancel the job and become a fixed error. Drop wakes and joins parked
 //! workers. No activation/weight pointer is retained for use by a later job.
-use crate::{Error, expert_kernel::Kernel, ops::Seg};
+use crate::{
+    Error,
+    expert_kernel::{Activation, Kernel},
+    ops::{self, Seg},
+};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -40,6 +44,8 @@ impl WaitPolicy {
 struct RawSeg {
     w: *const u8,
     x: *const f32,
+    /// Quantized rows in the pool's Q8_0 buffer when the job's activation is Q8_0.
+    xq: *const u8,
     n_out: usize,
     n_in: usize,
     y_off: usize,
@@ -62,6 +68,7 @@ struct Job {
     cancel: AtomicBool,
     failed: AtomicBool,
     kernel: Kernel,
+    activation: Activation,
     rows_done: AtomicUsize,
     fallbacks: AtomicUsize,
     #[cfg(test)]
@@ -82,6 +89,7 @@ impl Job {
             panic!("synthetic worker failure");
         }
         let row_bytes = self.k / 32 * 18;
+        let q_bytes = Activation::q8_row_bytes(self.k);
         let (mut rows, mut fallbacks) = (0, 0);
         loop {
             let a = self.next.fetch_add(16, Ordering::Relaxed);
@@ -106,8 +114,16 @@ impl Job {
                 unsafe {
                     let w = std::slice::from_raw_parts(seg.w.add(row * row_bytes), row_bytes);
                     for t in 0..seg.n_in {
-                        let x = std::slice::from_raw_parts(seg.x.add(t * self.k), self.k);
-                        let (v, fallback) = self.kernel.dot_counted(w, x, scratch);
+                        let (v, fallback) = match self.activation {
+                            Activation::F32 => {
+                                let x = std::slice::from_raw_parts(seg.x.add(t * self.k), self.k);
+                                self.kernel.dot_counted(w, x, scratch)
+                            }
+                            Activation::Q8_0 => {
+                                let xq = std::slice::from_raw_parts(seg.xq.add(t * q_bytes), q_bytes);
+                                (self.kernel.dot_q8(w, xq), false)
+                            }
+                        };
                         rows += 1;
                         fallbacks += usize::from(fallback);
                         *self.y.add(seg.y_off + t * seg.n_out + row) = v;
@@ -168,6 +184,10 @@ pub struct WorkerPool {
     kernel: Kernel,
     policy: WaitPolicy,
     stats: Stats,
+    activation: Activation,
+    /// Caller-owned Q8_0 activation rows; reserved once by `set_activation`, never
+    /// grown during a job, and only read by workers while a job is live.
+    qbuf: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -198,6 +218,8 @@ impl WorkerPool {
             kernel,
             policy,
             stats: Stats::default(),
+            activation: Activation::F32,
+            qbuf: Vec::new(),
         };
         for _ in 0..threads {
             let shared = Arc::clone(&pool.shared);
@@ -213,6 +235,31 @@ impl WorkerPool {
 
     pub fn kernel(&self) -> Kernel {
         self.kernel
+    }
+    pub fn activation(&self) -> Activation {
+        self.activation
+    }
+
+    /// Bytes `set_activation` reserves for Q8_0 rows of `max_inputs` activations.
+    pub fn q8_bytes(max_inputs: usize, max_width: usize) -> Option<usize> {
+        max_inputs.checked_mul(Activation::q8_row_bytes(max_width))
+    }
+
+    /// Select the activation domain. Q8_0 reserves room for `max_inputs` quantized
+    /// rows of the pool width up front, so evaluation never allocates; a job that
+    /// needs more is rejected rather than growing the buffer.
+    pub fn set_activation(&mut self, activation: Activation, max_inputs: usize) -> Result<(), Error> {
+        self.qbuf = match activation {
+            Activation::F32 => Vec::new(),
+            Activation::Q8_0 => {
+                let bytes = Self::q8_bytes(max_inputs, self.max_width)
+                    .filter(|&b| b > 0)
+                    .ok_or(Error::Resource("CPU expert Q8_0 activation buffer"))?;
+                vec![0; bytes]
+            }
+        };
+        self.activation = activation;
+        Ok(())
     }
     pub(crate) fn max_width(&self) -> usize {
         self.max_width
@@ -244,6 +291,8 @@ impl WorkerPool {
         let mut starts = Vec::with_capacity(segs.len() + 1);
         let mut raw = Vec::with_capacity(segs.len());
         let mut total = 0usize;
+        let q_bytes = Activation::q8_row_bytes(k);
+        let mut q_off = 0usize;
         for seg in segs {
             let outputs = seg.n_in.checked_mul(seg.n_out).ok_or(Error::Resource("CPU expert job size"))?;
             let end = seg.y_off.checked_add(outputs).ok_or(Error::Resource("CPU expert job size"))?;
@@ -258,9 +307,21 @@ impl WorkerPool {
             ranges.push((seg.y_off, end));
             starts.push(total);
             total = total.checked_add(seg.n_out).ok_or(Error::Resource("CPU expert row count"))?;
+            let mut xq = std::ptr::null();
+            if self.activation == Activation::Q8_0 {
+                let end = seg.n_in.checked_mul(q_bytes).and_then(|n| n.checked_add(q_off));
+                let dst = end
+                    .and_then(|end| self.qbuf.get_mut(q_off..end))
+                    .ok_or(Error::Resource("CPU expert Q8_0 activation buffer"))?;
+                // Each activation row is quantized once per job, on the caller thread.
+                ops::quantize_q8_0(seg.x, dst);
+                xq = dst.as_ptr();
+                q_off += dst.len();
+            }
             raw.push(RawSeg {
                 w: seg.w.as_ptr(),
                 x: seg.x.as_ptr(),
+                xq,
                 n_out: seg.n_out,
                 n_in: seg.n_in,
                 y_off: seg.y_off,
@@ -284,6 +345,7 @@ impl WorkerPool {
             cancel: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             kernel: self.kernel,
+            activation: self.activation,
             rows_done: AtomicUsize::new(0),
             fallbacks: AtomicUsize::new(0),
             #[cfg(test)]
@@ -438,6 +500,45 @@ mod tests {
     }
 
     #[test]
+    fn q8_activation_matches_kernel_dot_on_every_segment() {
+        let k = 96;
+        let (w1, w2) = (data(5, k), data(17, k));
+        let x: Vec<f32> = (0..3 * k).map(|i| (i as f32 * 0.13).sin()).collect();
+        let segs = [
+            Seg { w: &w1, x: &x, n_in: 3, n_out: 5, y_off: 2 },
+            Seg { w: &w2, x: &x[..k], n_in: 1, n_out: 17, y_off: 20 },
+        ];
+        let q = Activation::q8_row_bytes(k);
+        let mut xq = vec![0; 3 * q];
+        ops::quantize_q8_0(&x, &mut xq);
+        for kernel in [Kernel::Scalar, Kernel::best()] {
+            let mut reference = vec![0.0; 40];
+            for (seg, w) in segs.iter().zip([&w1, &w2]) {
+                for t in 0..seg.n_in {
+                    for r in 0..seg.n_out {
+                        reference[seg.y_off + t * seg.n_out + r] =
+                            kernel.dot_q8(&w[r * k / 32 * 18..(r + 1) * k / 32 * 18], &xq[t * q..(t + 1) * q]);
+                    }
+                }
+            }
+            let mut pool = WorkerPool::new(3, k, kernel, WaitPolicy::Sleep).unwrap();
+            pool.set_activation(Activation::Q8_0, 4).unwrap();
+            let mut out = vec![0.0; 40];
+            pool.matmul(&segs, k, &mut out, &|| false).unwrap();
+            assert_eq!(out, reference, "{kernel:?}");
+            assert_eq!(pool.stats().scalar_fallbacks, 0);
+            // Room for 3 rows only: the 4-row job is rejected, not grown.
+            pool.set_activation(Activation::Q8_0, 3).unwrap();
+            assert!(pool.matmul(&segs, k, &mut out, &|| false).is_err());
+            pool.set_activation(Activation::F32, 0).unwrap();
+            pool.matmul(&segs, k, &mut out, &|| false).unwrap();
+        }
+        let mut pool = WorkerPool::new(1, k, Kernel::Scalar, WaitPolicy::Sleep).unwrap();
+        assert!(pool.set_activation(Activation::Q8_0, 0).is_err());
+        assert_eq!(pool.activation(), Activation::F32);
+    }
+
+    #[test]
     fn cancellation_and_callback_unwind_drain_before_reuse() {
         let (k, rows) = (96, 101);
         let w = data(rows, k);
@@ -481,6 +582,7 @@ mod tests {
             cancel: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             kernel: Kernel::Scalar,
+            activation: Activation::F32,
             rows_done: AtomicUsize::new(0),
             fallbacks: AtomicUsize::new(0),
             force_panic: true,

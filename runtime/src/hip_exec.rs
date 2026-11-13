@@ -470,6 +470,20 @@ impl<'w, 'a> HipSession<'w, 'a> {
         }
     }
 
+    /// Select the CPU expert activation domain for host-placed layers (F32
+    /// reference by default). Without host expert layers only F32 is accepted.
+    pub fn set_expert_activation(&mut self, activation: crate::expert_kernel::Activation) -> Result<(), Error> {
+        let inputs = self.cfg.exec.max_batch.checked_mul(self.w.cfg.n_experts_used as usize);
+        match &mut self.experts {
+            Some(p) => p.set_activation(activation, inputs.ok_or(Error::Resource("size overflow"))?),
+            None if activation == crate::expert_kernel::Activation::F32 => Ok(()),
+            None => Err(Error::UnsupportedInput("no CPU expert layers for a Q8_0 activation")),
+        }
+    }
+    pub fn expert_activation(&self) -> crate::expert_kernel::Activation {
+        self.experts.as_ref().map_or_else(Default::default, WorkerPool::activation)
+    }
+
     pub fn reset(&mut self) {
         self.n_past = 0;
         self.written = 0;

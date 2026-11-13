@@ -175,7 +175,10 @@ enum Exec<'w, 'a> {
 
 impl<'w, 'a> Exec<'w, 'a> {
     fn new(args: &[String], w: &'w Weights<'a>, cfg: ExecConfig) -> Result<Self, Error> {
-        use rosevine_runtime::{expert_kernel::Kernel, expert_pool::WaitPolicy};
+        use rosevine_runtime::{
+            expert_kernel::{Activation, Kernel},
+            expert_pool::WaitPolicy,
+        };
         let kernel = match opt::<String>(args, "--expert-kernel").as_deref().unwrap_or("auto") {
             "auto" => Kernel::best(),
             "scalar" => Kernel::Scalar,
@@ -189,9 +192,23 @@ impl<'w, 'a> Exec<'w, 'a> {
             "spin" => WaitPolicy::BoundedSpin,
             _ => return Err(Error::UnsupportedInput("unknown --expert-wait")),
         };
-        eprintln!("cpu_experts kernel={} wait={wait:?}", kernel.name());
+        let activation = match opt::<String>(args, "--expert-activation").as_deref().unwrap_or("f32") {
+            "f32" => Activation::F32,
+            "q8_0" => Activation::Q8_0,
+            _ => return Err(Error::UnsupportedInput("unknown --expert-activation")),
+        };
+        let routine = if activation == Activation::Q8_0 { kernel.q8_name() } else { kernel.name() };
+        eprintln!(
+            "cpu_experts kernel={} activation={} routine={routine} wait={wait:?}",
+            kernel.name(),
+            activation.name()
+        );
         match opt::<String>(args, "--backend").as_deref().unwrap_or("cpu") {
-            "cpu" => Ok(Exec::Cpu(Box::new(Session::new_with_experts(w, cfg, kernel, wait)?))),
+            "cpu" => {
+                let mut s = Session::new_with_experts(w, cfg, kernel, wait)?;
+                s.set_expert_activation(activation)?;
+                Ok(Exec::Cpu(Box::new(s)))
+            }
             #[cfg(feature = "hip")]
             "hip" => {
                 rosevine_runtime::hip::init(0)?;
@@ -202,7 +219,8 @@ impl<'w, 'a> Exec<'w, 'a> {
                     max_vram: gib("--max-vram-gib", 10.0),
                     vram_reserve: gib("--vram-reserve-gib", 2.0),
                 };
-                let s = HipSession::new_with_experts(w, hc, kernel, wait)?;
+                let mut s = HipSession::new_with_experts(w, hc, kernel, wait)?;
+                s.set_expert_activation(activation)?;
                 eprintln!("hip session device_bytes={}", s.device_bytes());
                 Ok(Exec::Hip(Box::new(s)))
             }
@@ -271,6 +289,13 @@ impl<'w, 'a> Exec<'w, 'a> {
             Exec::Cpu(s) => s.reset(),
             #[cfg(feature = "hip")]
             Exec::Hip(s) => s.reset(),
+        }
+    }
+    fn expert_activation(&self) -> rosevine_runtime::expert_kernel::Activation {
+        match self {
+            Exec::Cpu(s) => s.expert_activation(),
+            #[cfg(feature = "hip")]
+            Exec::Hip(s) => s.expert_activation(),
         }
     }
 }
@@ -508,8 +533,9 @@ fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> 
         "{{\"schema\":\"rosevine-parity-replay-v1\",\"kind\":\"config\",\"engine\":\"rosevine\",\
          \"backend\":\"{backend}\",\"n_prompt\":{n_prompt},\"n_decode\":{n_decode},\"reps\":{reps},\
          \"n_ctx\":{ctx},\"n_batch\":{batch},\"n_ubatch\":{batch},\"threads\":{threads},\
-         \"cpu_moe_layers\":{cpu_moe},\"kv_type\":\"q8_0\",\"cpu_expert_activation\":\"f32\",\
+         \"cpu_moe_layers\":{cpu_moe},\"kv_type\":\"q8_0\",\"cpu_expert_activation\":\"{}\",\
          \"expert_kernel\":\"{}\",\"expert_wait\":\"{}\",\"tokens_fnv1a64\":\"{:016x}\"}}",
+        sess.expert_activation().name(),
         opt::<String>(args, "--expert-kernel").unwrap_or_else(|| "auto".into()),
         opt::<String>(args, "--expert-wait").unwrap_or_else(|| "sleep".into()),
         fnv1a64(&toks)

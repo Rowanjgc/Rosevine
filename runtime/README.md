@@ -27,3 +27,5 @@ to override.
 and `--expert-wait sleep|hybrid|spin`. Defaults are auto and sleep. Hybrid polls
 for at most 20 microseconds, spin for at most 100 microseconds, then workers park.
 AVX-512 requires Rust 1.89+ at build time; older supported compilers retain AVX2/scalar.
+`--expert-activation f32|q8_0` (default `f32`) selects the CPU expert activation domain; `q8_0`
+is the opt-in R3a.4 variant ([docs](../docs/cpu-experts-q8.md)) and is recorded in `replay`'s config.

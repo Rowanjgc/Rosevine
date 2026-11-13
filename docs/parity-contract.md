@@ -92,9 +92,11 @@ value that contradicts them.
 | Identity | engine, backend, source revision, binary SHA-256, `untuned`, series | The reference must be llama.cpp at `cd959bae…` (`frozen`) or `9daa0aa2…` (`newer-control`, reported separately). The candidate must be Rosevine HIP. |
 
 **Current state difference.** llama.cpp quantizes CPU-expert activations to Q8_0,
-while Rosevine's reference path is F32 (D3). Until the R3a.4 Q8_0 variant exists,
-every Rosevine/llama.cpp pair at matched placement is a
-`practical_configuration` comparison. This is reported, not hidden.
+while Rosevine's reference path is F32 (D3). With the default F32 path, every
+Rosevine/llama.cpp pair at matched placement is a `practical_configuration`
+comparison. This is reported, not hidden. R3a.4 added the opt-in
+`--expert-activation q8_0` ([Q8_0 CPU experts](cpu-experts-q8.md)); a replay run
+with it reports `q8_0` and removes this state difference.
 
 **Capacity alignment.** llama.cpp may pad `n_ctx`. Choose a capacity that is a
 multiple of 256 and pass it to both arms with `--ctx`. The adapters print the

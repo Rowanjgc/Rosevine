@@ -122,7 +122,7 @@ S/T/N checks, and must report CPU core-equivalents, thermal flags and peak VRAM.
 | Failure threshold | R3a.4's own: kept only if faster beyond noise with no KL-band regression. For parity planning, above 1.0 ms per layer means first-N = 10 cannot reach P90 without overlap. |
 | Correctness | Class N; R3a.4 acceptance (KL against both references, layer-0, selection flips). A Q8_0 activation profile also makes P3 pairs **machinery-parity** comparisons instead of practical ones. |
 | Maintenance | Low |
-| Activation | R3a.4 is ready (P3); it is the first implementable item |
+| Activation | R3a.4 done: opt-in `q8_0` measured 0.84 ms per layer at d512, decode ×1.48 and prefill ×2.29 against F32 inside the KL band ([Q8_0 CPU experts](cpu-experts-q8.md)). The parity cells have not been re-run with it. |
 
 ### G4. Device-side routing and indexed experts (new follow-up; needs activation)
 
