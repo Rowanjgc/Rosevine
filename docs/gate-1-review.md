@@ -163,11 +163,11 @@ every missing metric is labelled. Conditions on later candidate comparisons:
    desktop VRAM changed between arms.
 3. **Usefulness threshold.** Keep the 5% median-benefit threshold with a paired
    95% interval above zero, applied within a clock-state stratum.
-4. **Correctness.** Compare candidates against the Vulkan reference by
-   teacher-forced KL; its noise floor is 99.9% KLD 0.000046 with 100% top-1
-   agreement. A candidate must report its divergence from both Vulkan and the CPU
-   reference. No candidate may claim fidelity better than the unresolved
-   Vulkan–CPU gap until that gap is explained.
+4. **Correctness.** Superseded by the
+   [divergence review](reference-divergence-review.md#updated-tolerances-for-gate-3-and-later-candidates).
+   The Vulkan–CPU gap turned out to be the model's implementation-sensitivity
+   band, not a backend defect. Candidates report KL against both references,
+   exact-shape op conformance and layer-0 intermediate agreement.
 5. Greedy output identity is not a correctness criterion on Vulkan.
 
 ## Power profile decision (rv-19d)
@@ -212,8 +212,9 @@ outside benchmark windows is unchanged.
 
 ## Open items and deferrals
 
-- **Vulkan–CPU logit divergence** (KLD 0.056, 6.5% top-1 disagreement): diagnose
-  with the independent scalar oracles before Gate 3 reference-execution claims.
+- **Vulkan–CPU logit divergence:** diagnosed and bounded in the
+  [divergence review](reference-divergence-review.md). A CPU-only change (flash
+  attention on) moves the CPU reference as far as Vulkan does.
 - **Deferred from the minimal scope:** interaction cells; the 100-task and NLL
   quality evaluation on the holdout split; MTP draft-length sweeps; the sampled
   (temperature 1.0) policy; full 4096-position and per-layer intermediate captures;
