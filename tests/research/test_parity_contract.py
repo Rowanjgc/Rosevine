@@ -58,6 +58,21 @@ class Matrix(unittest.TestCase):
         self.assertEqual(statuses['ttft-warm-p512'], 'unsupported')
         self.assertEqual(P.matrix_v1()['matrix_sha256'], m['matrix_sha256'])
 
+    def test_feasibility_transition_is_forward_and_recorded(self):
+        m = P.advance_cell(P.matrix_v1(), 'decode-d2048', 'supported', 'top-1 0.945 vs HIP; rule met')
+        self.assertEqual({c['id']: c['status'] for c in m['cells']}['decode-d2048'], 'supported')
+        self.assertEqual(m['transitions'][0]['cell'], 'decode-d2048')
+        with self.assertRaises(ValueError):
+            P.advance_cell(m, 'decode-d2048', 'unsupported', 'again')
+        with self.assertRaises(ValueError):
+            P.advance_cell(m, 'ttft-warm-p128', 'supported', 'no harness')
+        forged = json.loads(json.dumps(P.matrix_v1()))
+        forged['cells'][1]['status'] = 'supported'
+        del forged['matrix_sha256']
+        forged['matrix_sha256'] = P.digest(forged)
+        with self.assertRaises(ValueError):
+            P.validate_matrix(forged)
+
     def test_edited_matrix_is_rejected(self):
         m = P.matrix_v1()
         m['cells'] = [c for c in m['cells'] if c['id'] != 'decode-d16384']
