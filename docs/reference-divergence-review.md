@@ -122,6 +122,17 @@ These replace Gate 1 condition 4.
 4. A candidate may not claim fidelity "better than" one reference based on lower
    KLD inside the band.
 
+## Update from C1 (2026-11-13)
+
+A third implementation, the HIP build, gave mean KLD 0.0798 against the CPU
+reference and 0.0690 against the Vulkan reference. Its layer-0 output agrees with
+the CPU reference to 7.4e-3, within the tolerance above. The band's upper
+estimate therefore moves to about 0.08.
+
+HIP's layer-0 `kqv_out` dump matches Vulkan's to about 1e-3, so the token-0
+anomaly comes from the GPU capture path and is not Vulkan-specific. See
+[backend evaluation](backend-evaluation-c1-c2.md).
+
 ## Limits
 
 - **KL coverage.** 1792 scored positions from one text domain.
