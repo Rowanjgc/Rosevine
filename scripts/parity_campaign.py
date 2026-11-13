@@ -22,9 +22,11 @@ LABEL = re.compile(r'^s(\d+)-(rv|hip|vk)-p(\d+)$')
 def resources(case):
     """`/usr/bin/time -v` and supervised telemetry; missing values stay None."""
     out = {'high_water_rss_bytes': None, 'cpu_core_seconds': None, 'vram_peak_bytes': None,
-           'thermal_flag_samples': 0, 'paging_warnings': 0}
+           'thermal_flag_samples': 0, 'paging_warnings': 0, 'cpu_core_equivalent': None}
     text = (case / 'resources.txt').read_text() if (case / 'resources.txt').exists() else ''
     rss = re.search(r'Maximum resident set size \(kbytes\): (\d+)', text)
+    share = re.search(r'Percent of CPU this job got: (\d+)%', text)
+    out['cpu_core_equivalent'] = int(share.group(1)) / 100 if share else None
     user = re.search(r'User time \(seconds\): ([\d.]+)', text)
     system = re.search(r'System time \(seconds\): ([\d.]+)', text)
     if rss:
@@ -74,7 +76,8 @@ def load_case(case, label_match):
             'prefill_tokens_per_s': statistics.median(r['prefill_tokens_per_s'] for r in measured),
             'decode_tokens_per_s': statistics.median(r['decode_tokens_per_s'] for r in measured)
             if replay['config']['n_decode'] else None,
-            'top1': measured[-1]['top1'], 'resident_bytes': resident, 'resources': resources(case)}
+            'top1': measured[-1]['top1'], 'prefill_top1': measured[-1]['prefill_top1'],
+            'resident_bytes': resident, 'resources': resources(case)}
 
 
 def declared(case, identity):
@@ -105,7 +108,7 @@ def reduce(campaign, identity, *, seed, agreement_floor, matrix=None):
         metric = 'decode_tokens_per_s' if cell['phase'] == 'decode' else 'prefill_tokens_per_s'
         # Prefill cells reuse the decode process at the same P when no prefill-only run exists.
         for baseline, ref_arm in (('vulkan', 'vk'), ('hip', 'hip')):
-            pairs, agreement, arms, res = [], [], None, []
+            pairs, agreement, arms, res, prefill_matches, cores, flags = [], [], None, [], [], [], []
             for (session, arm, prompt), cand in sorted(good.items()):
                 if arm != 'rv' or prompt != cell['n_prompt']:
                     continue
@@ -117,14 +120,25 @@ def reduce(campaign, identity, *, seed, agreement_floor, matrix=None):
                 pairs.append((ref[metric], cand[metric]))
                 if cand['top1'] and ref['top1']:
                     agreement.append(P.top1_agreement(cand['top1'], ref['top1']))
+                elif cand['prefill_top1'] is not None and ref['prefill_top1'] is not None:
+                    # Prefill-only run: one argmax per session; agreement is the session fraction.
+                    prefill_matches.append(cand['prefill_top1'] == ref['prefill_top1'])
                 res.append(P.resource_ratios(ref['resources'], cand['resources'], {}))
+                cores.append((ref['resources']['cpu_core_equivalent'], cand['resources']['cpu_core_equivalent']))
+                flags.append(ref['resources']['thermal_flag_samples'] + cand['resources']['thermal_flag_samples'])
                 arms = (ref, cand)
             if arms is None:
                 continue
+            if prefill_matches:
+                agreement.append(sum(prefill_matches) / len(prefill_matches))
             ref_arm_id = P.arm_from_replay(arms[0]['replay'], **declared(arms[0], identity))
             cand_arm_id = P.arm_from_replay(arms[1]['replay'], **declared(arms[1], identity))
             pairing = P.classify_pair(ref_arm_id, cand_arm_id, cell, baseline)
             detail = {'pairs': len(pairs), 'top1_agreement': agreement,
+                      'agreement_method': 'per-session prefill argmax match' if prefill_matches
+                      else 'per-step decode argmax agreement',
+                      'process_cpu_core_equivalent': [list(c) for c in cores],
+                      'pairs_with_thermal_flag_samples': sum(1 for f in flags if f),
                       'reference_values': [p[0] for p in pairs], 'candidate_values': [p[1] for p in pairs]}
             details[(cell['id'], baseline)] = detail
             if len(pairs) < P.MIN_PAIRS:
@@ -152,9 +166,14 @@ def main():
                         'fixture_sha256, hardware_class, power_policy, affinity')
     parser.add_argument('--seed', type=int, default=20261113)
     parser.add_argument('--agreement-floor', type=float, default=0.85)
+    parser.add_argument('--transitions', help='private JSON list of {cell, to, evidence} feasibility outcomes')
     args = parser.parse_args()
     identity = json.loads(Path(args.identity).read_text())
-    print(json.dumps(reduce(args.campaign, identity, seed=args.seed, agreement_floor=args.agreement_floor), indent=1))
+    matrix = P.matrix_v1()
+    for t in json.loads(Path(args.transitions).read_text()) if args.transitions else []:
+        matrix = P.advance_cell(matrix, t['cell'], t['to'], t['evidence'])
+    print(json.dumps(reduce(args.campaign, identity, seed=args.seed, agreement_floor=args.agreement_floor,
+                            matrix=matrix), indent=1))
 
 
 if __name__ == '__main__':

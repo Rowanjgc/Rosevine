@@ -68,9 +68,9 @@ comparator) and `hip` (same-backend diagnostic).
 | Cells | Family | Workload | Status |
 | --- | --- | --- | --- |
 | `decode-d512` | engine | 512-token prompt, 128 decode tokens | supported |
-| `decode-d2048`, `-d8192`, `-d16384` | engine | depth prompt, 128 decode tokens | feasibility check required |
+| `decode-d2048`, `-d8192`, `-d16384` | engine | depth prompt, 128 decode tokens | feasibility check required (all passed in P3; see [parity baselines](parity-baselines.md)) |
 | `prefill-p128`, `-p512` | engine | prompt from an empty cache | supported |
-| `prefill-p2048`, `-p8192` | engine | prompt from an empty cache | feasibility check required |
+| `prefill-p2048`, `-p8192` | engine | prompt from an empty cache | feasibility check required (passed in P3) |
 | `ttft-warm-p128` … `-p8192` | user_visible | warm TTFT on the same prompts | unsupported (no Rosevine delivery path) |
 
 "Feasibility check required" covers positions beyond the roughly 1,030 that R2

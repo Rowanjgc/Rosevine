@@ -90,6 +90,23 @@ def matrix_v1():
     return matrix
 
 
+def advance_cell(matrix, cell_id, status, evidence):
+    """Move one feasibility-gated cell forward on recorded evidence. The cell stays in
+    the denominator either way; nothing else may change."""
+    validate_matrix(matrix)
+    if status not in ('supported', 'unsupported') or not (isinstance(evidence, str) and evidence.strip()):
+        raise ValueError('forward status and evidence required')
+    out = json.loads(canonical({k: v for k, v in matrix.items() if k != 'matrix_sha256'}))
+    cell = next((c for c in out['cells'] if c['id'] == cell_id), None)
+    if cell is None or cell['status'] != 'feasibility_check_required':
+        raise ValueError('only a feasibility-gated cell can advance')
+    cell['status'] = status
+    cell['reason'] = evidence if status == 'unsupported' else None
+    out.setdefault('transitions', []).append({'cell': cell_id, 'to': status, 'evidence': evidence})
+    out['matrix_sha256'] = digest(out)
+    return validate_matrix(out)
+
+
 def validate_matrix(matrix):
     body = {k: v for k, v in matrix.items() if k != 'matrix_sha256'}
     if matrix.get('schema') != MATRIX_SCHEMA or digest(body) != matrix.get('matrix_sha256'):
@@ -97,6 +114,18 @@ def validate_matrix(matrix):
     ids = [c['id'] for c in matrix['cells']]
     if len(set(ids)) != len(ids):
         raise ValueError('duplicate matrix cell')
+    frozen = {c['id']: c for c in matrix_v1()['cells']}
+    if set(ids) != set(frozen):
+        raise ValueError('matrix cells differ from the frozen v1 denominator')
+    moved = {t['cell'] for t in matrix.get('transitions', [])}
+    for c in matrix['cells']:
+        base = frozen[c['id']]
+        if canonical({k: v for k, v in c.items() if k not in ('status', 'reason')}) != \
+                canonical({k: v for k, v in base.items() if k not in ('status', 'reason')}):
+            raise ValueError('frozen cell workload changed')
+        if c['status'] != base['status'] and (base['status'] != 'feasibility_check_required'
+                                               or c['id'] not in moved):
+            raise ValueError('cell status changed without a recorded forward transition')
     for c in matrix['cells']:
         if c['status'] not in ('supported', 'feasibility_check_required', 'unsupported'):
             raise ValueError('unknown cell status')
