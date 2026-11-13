@@ -217,6 +217,16 @@ impl<'w, 'a> Session<'w, 'a> {
         self.experts.reset_stats();
     }
 
+    /// Select the CPU expert activation domain (F32 reference by default). Q8_0
+    /// reserves its quantized rows for `max_batch * n_experts_used` inputs now.
+    pub fn set_expert_activation(&mut self, activation: crate::expert_kernel::Activation) -> Result<(), Error> {
+        let inputs = self.cfg.max_batch.checked_mul(self.w.cfg.n_experts_used as usize);
+        self.experts.set_activation(activation, inputs.ok_or(Error::Resource("size overflow"))?)
+    }
+    pub fn expert_activation(&self) -> crate::expert_kernel::Activation {
+        self.experts.activation()
+    }
+
     /// Cache/scratch capacities plus the configured worker stack/scratch/descriptor
     /// reservation (for bounded allocation and reuse checks; not measured RSS).
     pub fn held_bytes(&self) -> usize {
