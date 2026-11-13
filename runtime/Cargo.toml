@@ -4,10 +4,14 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-3.0-only"
-description = "Rosevine Gemma 4 reference runtime: validated artifact and text-input contracts (R1)"
+description = "Rosevine Gemma 4 reference runtime: artifact and text-input contracts (R1), target-only execution (R2)"
 publish = false
 
 # No third-party dependencies (CONTRIBUTING: add dependencies only for a demonstrated need).
+
+[features]
+# HIP backend (ADR 0001): builds hip/rvhip.hip with the system hipcc for gfx1101.
+hip = []
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

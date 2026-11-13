@@ -12,3 +12,8 @@ export PYTHONDONTWRITEBYTECODE=1
 cargo fmt --manifest-path runtime/Cargo.toml --check
 cargo clippy --manifest-path runtime/Cargo.toml --offline --locked --all-targets -- -D warnings
 cargo test --manifest-path runtime/Cargo.toml --offline --locked
+# HIP backend: compile (hipcc, warnings as errors) and lint where ROCm is installed. GPU
+# conformance tests are opt-in: cargo test --features hip --test hip_ops -- --ignored
+if command -v hipcc >/dev/null 2>&1; then
+  cargo clippy --manifest-path runtime/Cargo.toml --offline --locked --features hip --all-targets -- -D warnings
+fi

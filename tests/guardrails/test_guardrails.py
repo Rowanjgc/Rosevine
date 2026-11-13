@@ -148,7 +148,7 @@ class QualityTests(unittest.TestCase):
     def test_bad_link_and_malformed_adr(self):
         with tempfile.TemporaryDirectory(prefix='rosevine-doc-test-') as temp:
             repo = Path(temp) / 'repo'
-            shutil.copytree(ROOT, repo, ignore=shutil.ignore_patterns('.git', '.tools', '__pycache__'))
+            shutil.copytree(ROOT, repo, ignore=shutil.ignore_patterns('.git', '.tools', '__pycache__', 'target'))
             env = {'PATH': '/usr/bin:/bin', 'HOME': temp,
                    'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'}
             subprocess.run(['git', 'init', '-b', 'synthetic'], cwd=repo, env=env, capture_output=True, check=True)

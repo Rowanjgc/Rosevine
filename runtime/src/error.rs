@@ -21,6 +21,10 @@ pub enum Error {
     DigestMismatch,
     /// A long operation was stopped by its cancellation check.
     Cancelled,
+    /// A configured resource limit (context, batch, memory) would be exceeded.
+    Resource(&'static str),
+    /// The GPU runtime returned this error code.
+    Device(i32),
 }
 
 impl fmt::Display for Error {
@@ -35,6 +39,8 @@ impl fmt::Display for Error {
             Error::UnsupportedInput(why) => write!(f, "unsupported input: {why}"),
             Error::DigestMismatch => write!(f, "artifact digest mismatch"),
             Error::Cancelled => write!(f, "cancelled"),
+            Error::Resource(why) => write!(f, "resource limit: {why}"),
+            Error::Device(code) => write!(f, "device error {code}"),
         }
     }
 }
