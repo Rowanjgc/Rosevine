@@ -118,6 +118,17 @@ void eval_span(llama_context * ctx, const std::vector<llama_token> & toks, long 
     llama_batch_free(batch);
 }
 
+int argmax(llama_context * ctx, const llama_vocab * vocab) {
+    const float * lg = llama_get_logits_ith(ctx, -1);
+    if (!lg) throw std::runtime_error("missing output logits");
+    const int32_t n = llama_vocab_n_tokens(vocab);
+    int32_t best = 0;
+    for (int32_t i = 1; i < n; ++i) {
+        if (lg[i] > lg[best]) best = i;
+    }
+    return best;
+}
+
 void run(char ** a) {
     const char * model_path = a[0];
     const long n_prompt = parse_count(a[2], 1, 1 << 20);
@@ -190,15 +201,18 @@ void run(char ** a) {
         const int64_t t0 = now_ns();
         eval_span(ctx, toks, 0, n_prompt, n_batch);
         const int64_t prefill_ns = now_ns() - t0;
-        std::string steps;
+        const int prefill_top1 = argmax(ctx, vocab);
+        std::string steps, top1;
         for (long i = 0; i < n_decode; ++i) {
             const int64_t s = now_ns();
             eval_span(ctx, toks, n_prompt + i, n_prompt + i + 1, 1);
             steps += (i ? "," : "") + std::to_string(now_ns() - s);
+            // Correctness record only; computed after the timed span closes.
+            top1 += (i ? "," : "") + std::to_string(argmax(ctx, vocab));
         }
         printf("{\"schema\":\"rosevine-parity-replay-v1\",\"kind\":\"rep\",\"rep\":%ld,"
-               "\"prefill_ns\":%lld,\"decode_ns\":[%s]}\n",
-               r, static_cast<long long>(prefill_ns), steps.c_str());
+               "\"prefill_ns\":%lld,\"decode_ns\":[%s],\"prefill_top1\":%d,\"top1\":[%s]}\n",
+               r, static_cast<long long>(prefill_ns), steps.c_str(), prefill_top1, top1.c_str());
         fflush(stdout);
     }
     context.reset();

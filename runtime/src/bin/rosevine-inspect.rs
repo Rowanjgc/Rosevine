@@ -520,23 +520,35 @@ fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> 
         sess.reset();
         let t0 = Instant::now();
         let chunks = toks[..n_prompt].chunks(batch).count();
+        let (mut prefill_ns, mut prefill_top1) = (0, 0);
         for (i, ch) in toks[..n_prompt].chunks(batch).enumerate() {
-            let lg = sess.eval(ch, if i + 1 == chunks { Logits::Last } else { Logits::None }, &never, None)?;
-            std::hint::black_box(lg.first());
+            let last = i + 1 == chunks;
+            let lg = sess.eval(ch, if last { Logits::Last } else { Logits::None }, &never, None)?;
+            if last {
+                prefill_ns = t0.elapsed().as_nanos();
+                prefill_top1 = argmax(lg);
+            }
         }
-        let prefill_ns = t0.elapsed().as_nanos();
+        sess.instrument(args)?;
         let mut steps = Vec::with_capacity(n_decode);
+        let mut top1 = Vec::with_capacity(n_decode);
+        let t1 = Instant::now();
         for &t in &toks[n_prompt..] {
             let s = Instant::now();
             let lg = sess.eval(&[t], Logits::Last, &never, None)?;
             std::hint::black_box(lg.first());
             steps.push(s.elapsed().as_nanos().to_string());
+            // Correctness record only; computed after the timed span closes.
+            top1.push(argmax(lg).to_string());
         }
+        sess.report_instrumentation(t1.elapsed().as_secs_f64());
         writeln!(
             out,
             "{{\"schema\":\"rosevine-parity-replay-v1\",\"kind\":\"rep\",\"rep\":{rep},\
-             \"prefill_ns\":{prefill_ns},\"decode_ns\":[{}]}}",
-            steps.join(",")
+             \"prefill_ns\":{prefill_ns},\"decode_ns\":[{}],\"prefill_top1\":{prefill_top1},\
+             \"top1\":[{}]}}",
+            steps.join(","),
+            top1.join(",")
         )
         .ok();
         out.flush().ok();
