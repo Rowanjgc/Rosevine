@@ -600,3 +600,24 @@ recomputed from the reference tokenizer metadata and native binary. The optional
 public duplicates were removed while complete private identity stayed intact;
 no scanner, policy or allowlist changed. The subsequent worktree/history scans
 and full check pass. No credential material was identified by that investigation.
+
+## GPU baseline campaign and Gate 1 (2026-11-12)
+
+The campaign that closes Epic 2 is recorded in the [Gate 1 review](gate-1-review.md),
+with the updated [Gate 0 outcome](gate-0-review.md) and the revised
+[run rules](development/rule-audit.md#gpu-baseline-revision-2026-11-12).
+Tooling: [gpu_campaign.py](../scripts/gpu_campaign.py) with synthetic tests in
+`tests/research/test_gpu_campaign.py`. The earlier CPU exact-replay timeout was
+diagnosed from retained evidence as model-load swap churn. The `CPU_REPACK`
+allocation is 13.5 GiB anonymous; the load phase swapped out 5.9 GiB and took
+58 s of the 60 s budget. It was not an evaluation hang. Server sessions now have
+a separate model-load deadline.
+
+Acceptance closure:
+
+| Child | Outcome |
+| --- | --- |
+| B1 | Met. Frozen 1900/29000-token manifests replayed with verified `prompt_n` across 31 server sessions; capacity controls separate capacity from occupancy; failed and stopped attempts persisted; no operational endpoint used (private UNIX socket); collector overhead measured end to end; metric inventory in Gate 1 |
+| B2 | Met with recorded limits. The operation plan and proposed limits are unchanged; calibrated noise floors come from deterministic CPU and Vulkan teacher-forced repeats. 1792 rather than 4096 positions were captured because the calibration split holds 4082 tokens; 4096 remain planned. The unexplained Vulkan–CPU divergence is carried forward |
+| B3 | Met under the maintainer's minimal scope: four presets × three sessions plus seven one-factor controls; interaction cells deferred |
+| Gate 1 | GO (restricted), with conditions in the review |
