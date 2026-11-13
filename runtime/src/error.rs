@@ -25,6 +25,8 @@ pub enum Error {
     Resource(&'static str),
     /// The GPU runtime returned this error code.
     Device(i32),
+    /// A CPU expert worker panicked; every borrowed job has been drained.
+    Worker,
 }
 
 impl fmt::Display for Error {
@@ -41,6 +43,7 @@ impl fmt::Display for Error {
             Error::Cancelled => write!(f, "cancelled"),
             Error::Resource(why) => write!(f, "resource limit: {why}"),
             Error::Device(code) => write!(f, "device error {code}"),
+            Error::Worker => write!(f, "CPU expert worker failed"),
         }
     }
 }

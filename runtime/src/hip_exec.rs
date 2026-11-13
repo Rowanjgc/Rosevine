@@ -25,6 +25,8 @@ use crate::Error;
 use crate::exec::{
     self, ExecConfig, Logits, MoeBuffers, MoePlan, Observer, emit, emit_selection, experts_cpu, select_experts,
 };
+use crate::expert_kernel::Kernel;
+use crate::expert_pool::{WaitPolicy, WorkerPool};
 use crate::hip::{self, AttnShape, DevBuf};
 use crate::instr::{Instr, Mode, Span};
 use crate::model::Weights;
@@ -125,6 +127,7 @@ pub struct HipSession<'w, 'a> {
     written: usize,
     device_bytes: usize,
     probe: Option<Box<Probe>>,
+    experts: Option<WorkerPool>,
 }
 
 /// Instrumentation state: the span accumulator plus, in `Mode::Events`, one device event per span
@@ -261,6 +264,15 @@ impl<'w, 'a> HipSession<'w, 'a> {
     }
 
     pub fn new(w: &'w Weights<'a>, cfg: HipConfig) -> Result<Self, Error> {
+        Self::new_with_experts(w, cfg, Kernel::best(), WaitPolicy::Sleep)
+    }
+
+    pub fn new_with_experts(
+        w: &'w Weights<'a>,
+        cfg: HipConfig,
+        kernel: Kernel,
+        policy: WaitPolicy,
+    ) -> Result<Self, Error> {
         let ec = &cfg.exec;
         if ec.max_ctx == 0 || ec.max_batch == 0 || ec.threads == 0 {
             return Err(Error::Resource("zero limit"));
@@ -270,6 +282,25 @@ impl<'w, 'a> HipSession<'w, 'a> {
         }
         if cfg.cpu_expert_layers > w.layers.len() {
             return Err(Error::Resource("cpu_expert_layers exceeds the layer count"));
+        }
+        let c = &w.cfg;
+        let width = (c.n_embd as usize).max(c.ff_expert as usize);
+        let pool_bytes = if cfg.cpu_expert_layers > 0 {
+            WorkerPool::bytes_needed(ec.threads, width).ok_or(Error::Resource("CPU worker limits"))?
+        } else {
+            0
+        };
+        let host_per_token = c.n_experts as usize
+            + w.n_vocab()
+            + 2 * c.n_embd as usize
+            + c.n_experts_used as usize * (2 * c.n_embd as usize + 3 * c.ff_expert as usize);
+        let host_bytes = host_per_token
+            .checked_mul(ec.max_batch)
+            .and_then(|v| v.checked_mul(4))
+            .and_then(|v| v.checked_add(pool_bytes))
+            .ok_or(Error::Resource("host scratch size overflow"))?;
+        if host_bytes > ec.max_bytes {
+            return Err(Error::Resource("host scratch and workers exceed max_bytes"));
         }
         let need = Self::device_bytes_needed(w, &cfg).ok_or(Error::Resource("size overflow"))?;
         if need > cfg.max_vram {
@@ -363,6 +394,11 @@ impl<'w, 'a> HipSession<'w, 'a> {
             h: vec![0.0; b * u * fe],
             y: vec![0.0; b * u * e],
         };
+        let experts = if cfg.cpu_expert_layers > 0 {
+            Some(WorkerPool::new(ec.threads, e.max(fe), kernel, policy)?)
+        } else {
+            None
+        };
         Ok(HipSession {
             tok_embd: u8_buf(w.tok_embd)?,
             output_norm: f32_buf(&w.output_norm)?,
@@ -374,6 +410,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
             written: 0,
             device_bytes: need,
             probe: None,
+            experts,
             w,
             cfg,
         })
@@ -423,6 +460,14 @@ impl<'w, 'a> HipSession<'w, 'a> {
     /// Device bytes allocated by this session.
     pub fn device_bytes(&self) -> usize {
         self.device_bytes
+    }
+    pub fn expert_stats(&self) -> crate::expert_pool::Stats {
+        self.experts.as_ref().map_or_else(Default::default, WorkerPool::stats)
+    }
+    pub fn reset_expert_stats(&mut self) {
+        if let Some(p) = &mut self.experts {
+            p.reset_stats();
+        }
     }
 
     pub fn reset(&mut self) {
@@ -481,7 +526,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
                 hip::sync()?;
                 return Err(Error::Cancelled);
             }
-            self.layer(il, n, &mut obs)?;
+            self.layer(il, n, &mut obs, cancel)?;
         }
         if cancel() {
             hip::sync()?;
@@ -529,7 +574,13 @@ impl<'w, 'a> HipSession<'w, 'a> {
         Ok(())
     }
 
-    fn layer(&mut self, il: usize, n: usize, obs: &mut Option<Observer>) -> Result<(), Error> {
+    fn layer(
+        &mut self,
+        il: usize,
+        n: usize,
+        obs: &mut Option<Observer>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), Error> {
         let w = self.w;
         let c = &w.cfg;
         let l = &w.layers[il];
@@ -618,7 +669,17 @@ impl<'w, 'a> HipSession<'w, 'a> {
                 d.moe_in.download(0, &mut hs.moe_in[..n * e])?;
                 mark(&mut self.probe, Span::CpuExperts, il)?;
                 let buf = MoeBuffers { x: &mut hs.mx, gu: &mut hs.gu, h: &mut hs.h, y: &mut hs.y };
-                experts_cpu(l, e, fe, self.cfg.exec.threads, &hs.moe_in[..n * e], &plan, buf, &mut hs.moe_out[..n * e]);
+                experts_cpu(
+                    l,
+                    e,
+                    fe,
+                    self.experts.as_mut().ok_or(Error::Contract("host expert pool absent"))?,
+                    &hs.moe_in[..n * e],
+                    &plan,
+                    buf,
+                    &mut hs.moe_out[..n * e],
+                    cancel,
+                )?;
                 mark(&mut self.probe, Span::ExpOut, il)?;
                 d.moe.upload(0, &hs.moe_out[..n * e])?;
             }

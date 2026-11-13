@@ -6,6 +6,19 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    // AVX-512 intrinsics became stable in Rust 1.89. Preserve the 1.85 MSRV:
+    // older compilers build the scalar/AVX2 paths instead of parsing that module.
+    println!("cargo:rustc-check-cfg=cfg(rosevine_avx512)");
+    let version = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into())).arg("--version").output();
+    if let Ok(v) = version {
+        let text = String::from_utf8_lossy(&v.stdout);
+        let mut parts = text.split_whitespace().nth(1).unwrap_or("").split('.');
+        let major = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        let minor = parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        if v.status.success() && (major > 1 || (major == 1 && minor >= 89)) {
+            println!("cargo:rustc-cfg=rosevine_avx512");
+        }
+    }
     println!("cargo:rerun-if-changed=hip/rvhip.hip");
     println!("cargo:rerun-if-changed=hip/rvhip.h");
     println!("cargo:rerun-if-env-changed=ROSEVINE_HIP_ARCH");

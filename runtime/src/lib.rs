@@ -12,6 +12,8 @@ pub mod chat;
 pub mod contract;
 pub mod error;
 pub mod exec;
+pub mod expert_kernel;
+pub mod expert_pool;
 pub mod gguf;
 #[cfg(feature = "hip")]
 pub mod hip;

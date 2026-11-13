@@ -172,8 +172,23 @@ enum Exec<'w, 'a> {
 
 impl<'w, 'a> Exec<'w, 'a> {
     fn new(args: &[String], w: &'w Weights<'a>, cfg: ExecConfig) -> Result<Self, Error> {
+        use rosevine_runtime::{expert_kernel::Kernel, expert_pool::WaitPolicy};
+        let kernel = match opt::<String>(args, "--expert-kernel").as_deref().unwrap_or("auto") {
+            "auto" => Kernel::best(),
+            "scalar" => Kernel::Scalar,
+            "avx2" => Kernel::Avx2,
+            "avx512" => Kernel::Avx512,
+            _ => return Err(Error::UnsupportedInput("unknown --expert-kernel")),
+        };
+        let wait = match opt::<String>(args, "--expert-wait").as_deref().unwrap_or("sleep") {
+            "sleep" => WaitPolicy::Sleep,
+            "hybrid" => WaitPolicy::Hybrid,
+            "spin" => WaitPolicy::BoundedSpin,
+            _ => return Err(Error::UnsupportedInput("unknown --expert-wait")),
+        };
+        eprintln!("cpu_experts kernel={} wait={wait:?}", kernel.name());
         match opt::<String>(args, "--backend").as_deref().unwrap_or("cpu") {
-            "cpu" => Ok(Exec::Cpu(Box::new(Session::new(w, cfg)?))),
+            "cpu" => Ok(Exec::Cpu(Box::new(Session::new_with_experts(w, cfg, kernel, wait)?))),
             #[cfg(feature = "hip")]
             "hip" => {
                 rosevine_runtime::hip::init(0)?;
@@ -184,7 +199,7 @@ impl<'w, 'a> Exec<'w, 'a> {
                     max_vram: gib("--max-vram-gib", 10.0),
                     vram_reserve: gib("--vram-reserve-gib", 2.0),
                 };
-                let s = HipSession::new(w, hc)?;
+                let s = HipSession::new_with_experts(w, hc, kernel, wait)?;
                 eprintln!("hip session device_bytes={}", s.device_bytes());
                 Ok(Exec::Hip(Box::new(s)))
             }
@@ -208,6 +223,11 @@ impl<'w, 'a> Exec<'w, 'a> {
 
     /// `--instr host|sync|events` (HIP only): instrument the decode steps that follow (R3a.1).
     fn instrument(&mut self, args: &[String]) -> Result<(), Error> {
+        match self {
+            Self::Cpu(s) => s.reset_expert_stats(),
+            #[cfg(feature = "hip")]
+            Self::Hip(s) => s.reset_expert_stats(),
+        }
         let Some(m) = opt::<String>(args, "--instr") else { return Ok(()) };
         let mode = rosevine_runtime::instr::Mode::parse(&m).ok_or(Error::UnsupportedInput("unknown --instr mode"))?;
         match self {
@@ -222,6 +242,12 @@ impl<'w, 'a> Exec<'w, 'a> {
 
     /// Print the instrumentation summary (timings and counts only) to stderr.
     fn report_instrumentation(&self, loop_s: f64) {
+        let stats = match self {
+            Self::Cpu(s) => s.expert_stats(),
+            #[cfg(feature = "hip")]
+            Self::Hip(s) => s.expert_stats(),
+        };
+        eprintln!("cpu_expert_rows={} scalar_fallback_rows={}", stats.rows, stats.scalar_fallbacks);
         #[cfg(feature = "hip")]
         if let Exec::Hip(s) = self {
             if let Some(i) = s.instrumentation() {

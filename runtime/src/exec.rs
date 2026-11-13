@@ -15,6 +15,8 @@
 //!   [`ExecConfig`], and checked against `max_bytes` before allocation.
 
 use crate::Error;
+use crate::expert_kernel::Kernel;
+use crate::expert_pool::{WaitPolicy, WorkerPool};
 use crate::model::{Layer, Weights};
 use crate::ops::{self, Q8_BLOCK, QK, Seg};
 
@@ -110,6 +112,7 @@ pub struct Session<'w, 'a> {
     /// Highest position ever written plus one; bounds how far [`Session::rewind`] may go.
     written: usize,
     s: Scratch,
+    experts: WorkerPool,
 }
 
 impl std::fmt::Debug for Session<'_, '_> {
@@ -132,10 +135,20 @@ impl<'w, 'a> Session<'w, 'a> {
             kv = kv.checked_add(cap.checked_mul(l.n_kv_heads)?.checked_mul(row)?.checked_mul(2)?)?;
         }
         let floats = scratch_floats(w, cfg.max_batch)?;
-        kv.checked_add(floats.checked_mul(4)?)
+        kv.checked_add(floats.checked_mul(4)?)?
+            .checked_add(WorkerPool::bytes_needed(cfg.threads, (c.n_embd as usize).max(c.ff_expert as usize))?)
     }
 
     pub fn new(w: &'w Weights<'a>, cfg: ExecConfig) -> Result<Self, Error> {
+        Self::new_with_experts(w, cfg, Kernel::best(), WaitPolicy::Sleep)
+    }
+
+    pub fn new_with_experts(
+        w: &'w Weights<'a>,
+        cfg: ExecConfig,
+        kernel: Kernel,
+        policy: WaitPolicy,
+    ) -> Result<Self, Error> {
         if cfg.max_ctx == 0 || cfg.max_batch == 0 || cfg.threads == 0 {
             return Err(Error::Resource("zero limit"));
         }
@@ -186,7 +199,8 @@ impl<'w, 'a> Session<'w, 'a> {
         ] {
             *buf = vec![0.0; n];
         }
-        Ok(Session { w, cfg, kv, n_past: 0, written: 0, s })
+        let experts = WorkerPool::new(cfg.threads, e.max(fe), kernel, policy)?;
+        Ok(Session { w, cfg, kv, n_past: 0, written: 0, s, experts })
     }
 
     pub fn n_past(&self) -> usize {
@@ -196,8 +210,15 @@ impl<'w, 'a> Session<'w, 'a> {
     pub fn config(&self) -> &ExecConfig {
         &self.cfg
     }
+    pub fn expert_stats(&self) -> crate::expert_pool::Stats {
+        self.experts.stats()
+    }
+    pub fn reset_expert_stats(&mut self) {
+        self.experts.reset_stats();
+    }
 
-    /// Total bytes currently held by the cache and scratch buffers (for leak/reuse checks).
+    /// Cache/scratch capacities plus the configured worker stack/scratch/descriptor
+    /// reservation (for bounded allocation and reuse checks; not measured RSS).
     pub fn held_bytes(&self) -> usize {
         let kv: usize = self.kv.iter().map(|l| l.k.capacity() + l.v.capacity()).sum();
         let s = &self.s;
@@ -209,6 +230,7 @@ impl<'w, 'a> Session<'w, 'a> {
         .map(|v| v.capacity())
         .sum();
         kv + 4 * f
+            + WorkerPool::bytes_needed(self.cfg.threads, self.experts.max_width()).expect("validated worker bounds")
     }
 
     /// Forget every position, keeping all allocations for reuse.
@@ -236,7 +258,8 @@ impl<'w, 'a> Session<'w, 'a> {
     }
 
     /// Evaluate `tokens` at positions `n_past..`. Returns logits (`n_vocab` per selected row) and
-    /// advances `n_past` only if the whole batch succeeds. `cancel` is checked between layers.
+    /// advances `n_past` only if the whole batch succeeds. `cancel` is checked between layers
+    /// and while CPU expert jobs run; cancelled jobs are drained before returning.
     pub fn eval(
         &mut self,
         tokens: &[u32],
@@ -276,7 +299,7 @@ impl<'w, 'a> Session<'w, 'a> {
             if cancel() {
                 return Err(Error::Cancelled);
             }
-            self.layer(il, n, &mut obs);
+            self.layer(il, n, &mut obs, cancel)?;
         }
         if cancel() {
             return Err(Error::Cancelled);
@@ -308,7 +331,13 @@ impl<'w, 'a> Session<'w, 'a> {
         Ok(&self.s.logits[..n_out * vocab])
     }
 
-    fn layer(&mut self, il: usize, n: usize, obs: &mut Option<Observer>) {
+    fn layer(
+        &mut self,
+        il: usize,
+        n: usize,
+        obs: &mut Option<Observer>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), Error> {
         let w = self.w;
         let c = &w.cfg;
         let l: &Layer = &w.layers[il];
@@ -429,7 +458,7 @@ impl<'w, 'a> Session<'w, 'a> {
         }
         let plan = MoePlan::new(&sel, n, used);
         let buf = MoeBuffers { x: &mut s.moe_x, gu: &mut s.moe_gu, h: &mut s.moe_h, y: &mut s.moe_y };
-        experts_cpu(l, e, fe, th, &s.moe_in[..n * e], &plan, buf, &mut s.moe[..n * e]);
+        experts_cpu(l, e, fe, &mut self.experts, &s.moe_in[..n * e], &plan, buf, &mut s.moe[..n * e], cancel)?;
         for out in s.moe[..n * e].chunks_exact_mut(e) {
             ops::rms_norm(out, Some(&l.post_ffw_norm_2), eps);
         }
@@ -446,6 +475,7 @@ impl<'w, 'a> Session<'w, 'a> {
             x.iter_mut().zip(a).for_each(|(x, &r)| *x = (*x + r) * l.out_scale);
         }
         emit(obs, "l_out", ilg, &s.x[..n * e]);
+        Ok(())
     }
 }
 
@@ -533,12 +563,13 @@ pub(crate) fn experts_cpu(
     l: &Layer,
     e: usize,
     fe: usize,
-    th: usize,
+    pool: &mut WorkerPool,
     moe_in: &[f32],
     plan: &MoePlan,
     b: MoeBuffers,
     out: &mut [f32],
-) {
+    cancel: &dyn Fn() -> bool,
+) -> Result<(), Error> {
     let pairs = plan.sel.len();
     let used = plan.used;
     for (k, &i) in plan.order.iter().enumerate() {
@@ -560,7 +591,7 @@ pub(crate) fn experts_cpu(
                 y_off: st * gu_rows,
             })
             .collect();
-        ops::matmul_q4_0_multi(&segs, e, &mut b.gu[..pairs * gu_rows], th);
+        pool.matmul(&segs, e, &mut b.gu[..pairs * gu_rows], cancel)?;
     }
     for k in 0..pairs {
         let (g, u) = b.gu[k * gu_rows..(k + 1) * gu_rows].split_at(fe);
@@ -580,7 +611,7 @@ pub(crate) fn experts_cpu(
                 y_off: st * e,
             })
             .collect();
-        ops::matmul_q4_0_multi(&segs, fe, &mut b.y[..pairs * e], th);
+        pool.matmul(&segs, fe, &mut b.y[..pairs * e], cancel)?;
     }
     for (t, o) in out.chunks_exact_mut(e).enumerate() {
         for j in 0..used {
@@ -595,6 +626,7 @@ pub(crate) fn experts_cpu(
             }
         }
     }
+    Ok(())
 }
 
 pub(crate) fn emit(obs: &mut Option<Observer>, name: &str, layer: i32, data: &[f32]) {
