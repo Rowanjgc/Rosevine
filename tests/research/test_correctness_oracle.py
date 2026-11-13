@@ -113,6 +113,23 @@ class OracleTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 C.router_projection([1, 2], 1e-6, inverse, scale, [[1, 1]])
 
+    def test_router_mixture_composes_projection_weights_and_reduction(self):
+        import math
+        a = math.sqrt(2) / 2  # width-scaled first component of RMSNorm([1, 0])
+        result = C.gemma4_router_mixture([1, 0], 1e-30, .5, [1, 1],
+                                         [[0, 0], [math.log(3) / a, 0], [0, 0]],
+                                         [1, 0], [[4, 0], [0, 8]])
+        for got, want in zip(result['router']['logits'], [0, math.log(3), 0]):
+            self.assertAlmostEqual(got, want, places=12)
+        # softmax [1/5, 3/5, 1/5]; selected (1, 0) renormalized to (3/4, 1/4)
+        for got, want in zip(result['selection_weights']['weights'], [.75, .25]):
+            self.assertAlmostEqual(got, want, places=12)
+        for got, want in zip(result['mixture'], [3, 2]):
+            self.assertAlmostEqual(got, want, places=12)
+        for ids, outputs in [([1, 0], [[4, 0]]), ([], []), ([1, 0], 'x')]:
+            with self.assertRaises(ValueError):
+                C.gemma4_router_mixture([1, 0], 1e-30, .5, [1, 1], [[0, 0], [1, 0]], ids, outputs)
+
     def test_gelu_symmetry_and_large_limits(self):
         result = C.gelu_tanh([-10, -1, 0, 1, 10])
         self.assertEqual(result[0], 0)
