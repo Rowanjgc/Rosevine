@@ -574,7 +574,7 @@ fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> 
         sess.expert_activation().name(),
         opt::<String>(args, "--expert-kernel").unwrap_or_else(|| "auto".into()),
         opt::<String>(args, "--expert-wait").unwrap_or_else(|| "sleep".into()),
-        opt::<String>(args, "--attention").unwrap_or_else(|| "ref".into()),
+        opt::<String>(args, "--attention").unwrap_or_else(|| "split".into()),
         fnv1a64(&toks)
     )
     .ok();
@@ -658,7 +658,10 @@ fn ab_attention(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), E
         return Err(Error::UnsupportedInput("--n-decode exceeds the rewindable span (batch + 1)"));
     }
     let batch = cfg.max_batch;
-    let Exec::Hip(mut sess) = Exec::new(args, &w, cfg)? else {
+    // The session needs the reference kernel's scratch to switch between both kernels.
+    let mut with_ref = args.to_vec();
+    with_ref.extend(["--attention".to_string(), "ref".to_string()]);
+    let Exec::Hip(mut sess) = Exec::new(&with_ref, &w, cfg)? else {
         return Err(Error::UnsupportedInput("ab-attention needs --backend hip"));
     };
     writeln!(
