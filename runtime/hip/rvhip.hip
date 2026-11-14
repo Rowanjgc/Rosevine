@@ -126,6 +126,47 @@ __global__ void k_q4_mm(const uint8_t *w, const float *x, float *y, int n_out, i
     }
 }
 
+// Q4_0 x f32 GEMV/GEMM (K2). One warp per output row, TT tokens per launch row-tile, as k_q4_mm.
+// Each lane takes a quarter of a block per step: one 32-bit load of 4 packed bytes (elements
+// 4q..4q+3 and 16+4q..16+4q+3) and two float4 activation loads, so a warp reads warpSize/4
+// consecutive blocks at once. Needs 16-byte aligned activation rows (checked by the caller).
+__global__ void k_q4_mv(const uint8_t *w, const float *x, float *y, int n_out, int k, int n_in) {
+    const int warps = blockDim.x / warpSize;
+    const int r = blockIdx.x * warps + threadIdx.x / warpSize;
+    const int lane = threadIdx.x % warpSize;
+    const int t0 = blockIdx.y * TT;
+    if (r >= n_out) return;
+    const int nt = min(TT, n_in - t0);
+    const int nq = k / QK * 4;
+    const uint8_t *row = w + (size_t)r * (k / QK) * Q4_BLOCK;
+    float acc[TT];
+    for (int i = 0; i < TT; ++i) acc[i] = 0.f;
+    for (int i = lane; i < nq; i += warpSize) {
+        const int b = i >> 2, q = i & 3;
+        const uint8_t *blk = row + (size_t)b * Q4_BLOCK;
+        const float d = f16(blk);
+        const uint16_t *p = (const uint16_t *)(blk + 2 + 4 * q);
+        const uint32_t qs = (uint32_t)p[0] | ((uint32_t)p[1] << 16);
+        float lo[4], hi[4];
+        for (int j = 0; j < 4; ++j) {
+            lo[j] = (float)((int)((qs >> (8 * j)) & 15u) - 8);
+            hi[j] = (float)((int)((qs >> (8 * j + 4)) & 15u) - 8);
+        }
+        for (int t = 0; t < TT; ++t) {
+            if (t >= nt) break;
+            const float *xs = x + (size_t)(t0 + t) * k + b * QK + 4 * q;
+            const float4 a = *(const float4 *)xs;
+            const float4 c = *(const float4 *)(xs + 16);
+            acc[t] += d * (lo[0] * a.x + lo[1] * a.y + lo[2] * a.z + lo[3] * a.w + hi[0] * c.x + hi[1] * c.y +
+                           hi[2] * c.z + hi[3] * c.w);
+        }
+    }
+    for (int t = 0; t < nt; ++t) {
+        const float s = warp_sum(acc[t]);
+        if (lane == 0) y[(size_t)(t0 + t) * n_out + r] = s;
+    }
+}
+
 __global__ void k_f32_mm(const float *w, const float *x, float *y, int n_out, int k, int n_in) {
     const int warps = blockDim.x / warpSize;
     const int r = blockIdx.x * warps + threadIdx.x / warpSize;
@@ -488,6 +529,15 @@ int rvh_q4_mm(const void *w, const float *x, float *y, int n_out, int k, int n_i
     CHECK_DIMS(w && x && y && n_out > 0 && n_in > 0 && k > 0 && k % QK == 0);
     const int warps = 256 / g_warp;
     hipLaunchKernelGGL(k_q4_mm, dim3(blocks(n_out, warps), blocks(n_in, TT)), dim3(256), 0, 0, (const uint8_t *)w, x,
+                       y, n_out, k, n_in);
+    return launched();
+}
+
+int rvh_q4_mv(const void *w, const float *x, float *y, int n_out, int k, int n_in) {
+    CHECK_DIMS(w && x && y && n_out > 0 && n_in > 0 && k > 0 && k % QK == 0 && ((uintptr_t)x & 15) == 0 &&
+               ((uintptr_t)w & 1) == 0);
+    const int warps = 256 / g_warp;
+    hipLaunchKernelGGL(k_q4_mv, dim3(blocks(n_out, warps), blocks(n_in, TT)), dim3(256), 0, 0, (const uint8_t *)w, x,
                        y, n_out, k, n_in);
     return launched();
 }

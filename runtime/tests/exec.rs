@@ -383,6 +383,7 @@ mod hip_synthetic {
             max_vram: 1 << 30,
             vram_reserve: 0,
             attention: Default::default(),
+            q4: Default::default(),
         }
     }
 
@@ -444,6 +445,31 @@ mod hip_synthetic {
         switched.reset();
         switched.set_attention(Attention::Reference).unwrap();
         assert_eq!(digest(&run(&mut switched, &toks)), digest(&reference));
+    }
+
+    /// K2: the quarter-block Q4_0 kernel gives the reference kernel's logits up to summation
+    /// order, end to end, and switching back restores the reference bitwise.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn q4_vec_kernel_matches_the_reference_kernel_end_to_end() {
+        use rosevine_runtime::hip_exec::Q4Kernel;
+        hip::init(0).unwrap();
+        let m = model(&PATTERN_HIP, 11);
+        let w = weights(&m);
+        let toks = tokens(32, 9);
+        let mut sess = HipSession::new(&w, hip_cfg(2)).unwrap();
+        assert_eq!(sess.q4_kernel(), Q4Kernel::Reference);
+        let reference = run(&mut sess, &toks);
+        sess.reset();
+        sess.set_q4_kernel(Q4Kernel::Vec);
+        let v = run(&mut sess, &toks);
+        let num: f64 = v.iter().zip(&reference).map(|(x, y)| f64::from(x - y).powi(2)).sum();
+        let den: f64 = reference.iter().map(|y| f64::from(*y).powi(2)).sum();
+        let e = (num / den).sqrt();
+        assert!(e < 1e-4, "vec session rel {e}");
+        sess.reset();
+        sess.set_q4_kernel(Q4Kernel::Reference);
+        assert_eq!(digest(&run(&mut sess, &toks)), digest(&reference));
     }
 
     /// Device calls of one single-token decode evaluation with `Logits::Last`, counted by hand

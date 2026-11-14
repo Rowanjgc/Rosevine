@@ -81,6 +81,7 @@ mod ffi {
             window: c_int,
             max_keys: c_int,
         ) -> c_int;
+        pub fn rvh_q4_mv(w: *const c_void, x: *const f32, y: *mut f32, n_out: c_int, k: c_int, n_in: c_int) -> c_int;
         pub fn rvh_attn_split(
             q: *const f32,
             kc: *const c_void,
@@ -376,6 +377,18 @@ pub fn q4_mm(w: B, x: F, y: F, n_out: usize, k: usize, n_in: usize) -> Result<()
     let (wp, xp, yp) = (w.p(n_out * Q4_ROW(k))?, x.p(n_in * k)?, y.p(n_in * n_out)?);
     // SAFETY: all ranges checked against their allocations.
     launched(unsafe { ffi::rvh_q4_mm(wp, xp, yp, int(n_out)?, int(k)?, int(n_in)?) })
+}
+
+/// [`q4_mm`] with the K2 quarter-block kernel; same result up to summation order. Falls back to
+/// [`q4_mm`] when the activations are not 16-byte aligned or the weights not 2-byte aligned.
+pub fn q4_mv(w: B, x: F, y: F, n_out: usize, k: usize, n_in: usize) -> Result<(), Error> {
+    let (wp, xp, yp) = (w.p(n_out * Q4_ROW(k))?, x.p(n_in * k)?, y.p(n_in * n_out)?);
+    if (xp as usize) % 16 != 0 || (wp as usize) % 2 != 0 {
+        // SAFETY: all ranges checked against their allocations.
+        return launched(unsafe { ffi::rvh_q4_mm(wp, xp, yp, int(n_out)?, int(k)?, int(n_in)?) });
+    }
+    // SAFETY: all ranges checked against their allocations; alignment checked above.
+    launched(unsafe { ffi::rvh_q4_mv(wp, xp, yp, int(n_out)?, int(k)?, int(n_in)?) })
 }
 
 pub fn f32_mm(w: F, x: F, y: F, n_out: usize, k: usize, n_in: usize) -> Result<(), Error> {

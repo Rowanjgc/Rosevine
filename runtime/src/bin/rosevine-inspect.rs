@@ -12,7 +12,7 @@
 //! rosevine-inspect replay   <gguf> --n-prompt P --n-decode D [--reps R] [--batch B] [--threads T] [--ctx C]
 //!                           [--instr MODE] [--instr-prefill MODE] [--instr-per-layer] [--attention ref|split]
 //!                                                     # stdin: P + D frozen token ids (parity P1)
-//! rosevine-inspect ab-attention <gguf> --n-prompt P --n-decode D --pairs K [--batch B] [--threads T]
+//! rosevine-inspect ab-attention <gguf> --n-prompt P --n-decode D --pairs K [--compare attention|q4] [--batch B] [--threads T]
 //!                                                     # stdin: P + D frozen token ids (K3, hip only)
 //! ```
 //!
@@ -226,6 +226,11 @@ impl<'w, 'a> Exec<'w, 'a> {
                     attention: match opt::<String>(args, "--attention") {
                         Some(a) => rosevine_runtime::hip_exec::Attention::parse(&a)
                             .ok_or(Error::UnsupportedInput("--attention must be ref or split"))?,
+                        None => Default::default(),
+                    },
+                    q4: match opt::<String>(args, "--q4") {
+                        Some(k) => rosevine_runtime::hip_exec::Q4Kernel::parse(&k)
+                            .ok_or(Error::UnsupportedInput("--q4 must be ref or vec"))?,
                         None => Default::default(),
                     },
                 };
@@ -570,11 +575,12 @@ fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> 
          \"backend\":\"{backend}\",\"n_prompt\":{n_prompt},\"n_decode\":{n_decode},\"reps\":{reps},\
          \"n_ctx\":{ctx},\"n_batch\":{batch},\"n_ubatch\":{batch},\"threads\":{threads},\
          \"cpu_moe_layers\":{cpu_moe},\"kv_type\":\"q8_0\",\"cpu_expert_activation\":\"{}\",\
-         \"expert_kernel\":\"{}\",\"expert_wait\":\"{}\",\"attention\":\"{}\",\"tokens_fnv1a64\":\"{:016x}\"}}",
+         \"expert_kernel\":\"{}\",\"expert_wait\":\"{}\",\"attention\":\"{}\",\"q4\":\"{}\",\"tokens_fnv1a64\":\"{:016x}\"}}",
         sess.expert_activation().name(),
         opt::<String>(args, "--expert-kernel").unwrap_or_else(|| "auto".into()),
         opt::<String>(args, "--expert-wait").unwrap_or_else(|| "sleep".into()),
         opt::<String>(args, "--attention").unwrap_or_else(|| "split".into()),
+        opt::<String>(args, "--q4").unwrap_or_else(|| "ref".into()),
         fnv1a64(&toks)
     )
     .ok();
@@ -632,14 +638,22 @@ fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> 
 /// per-step nanoseconds and top-1 ids.
 #[cfg(feature = "hip")]
 fn ab_attention(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> {
-    use rosevine_runtime::hip_exec::Attention;
+    use rosevine_runtime::hip_exec::{Attention, Q4Kernel};
+    // Which kernel pair the blocks alternate: attention (K3: ref vs split, Q4 ref) or q4 (K2: Q4
+    // ref vs vec, split attention in both arms).
+    let compare = opt::<String>(args, "--compare").unwrap_or_else(|| "attention".into());
+    if compare != "attention" && compare != "q4" {
+        return Err(Error::UnsupportedInput("--compare must be attention or q4"));
+    }
     let n_prompt: usize = opt(args, "--n-prompt").ok_or(Error::UnsupportedInput("--n-prompt required"))?;
     let n_decode: usize = opt(args, "--n-decode").ok_or(Error::UnsupportedInput("--n-decode required"))?;
     let pairs: usize = opt(args, "--pairs").ok_or(Error::UnsupportedInput("--pairs required"))?;
     if n_prompt == 0 || n_decode == 0 || !(1..=1000).contains(&pairs) {
         return Err(Error::UnsupportedInput("--n-prompt and --n-decode must be positive and --pairs 1..=1000"));
     }
-    if opt::<String>(args, "--backend").as_deref() != Some("hip") || args.iter().any(|a| a == "--attention") {
+    if opt::<String>(args, "--backend").as_deref() != Some("hip")
+        || args.iter().any(|a| a == "--attention" || a == "--q4")
+    {
         return Err(Error::UnsupportedInput("ab-attention needs --backend hip and sets the kernel itself"));
     }
     let mut line = String::new();
@@ -658,9 +672,12 @@ fn ab_attention(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), E
         return Err(Error::UnsupportedInput("--n-decode exceeds the rewindable span (batch + 1)"));
     }
     let batch = cfg.max_batch;
-    // The session needs the reference kernel's scratch to switch between both kernels.
+    // The session needs the reference kernel's scratch to switch between both attention kernels;
+    // a Q4 comparison keeps the default (split) attention. Prefill always uses the Q4 reference.
     let mut with_ref = args.to_vec();
-    with_ref.extend(["--attention".to_string(), "ref".to_string()]);
+    if compare == "attention" {
+        with_ref.extend(["--attention".to_string(), "ref".to_string()]);
+    }
     let Exec::Hip(mut sess) = Exec::new(&with_ref, &w, cfg)? else {
         return Err(Error::UnsupportedInput("ab-attention needs --backend hip"));
     };
@@ -668,8 +685,9 @@ fn ab_attention(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), E
         out,
         "{{\"schema\":\"rosevine-ab-attention-v1\",\"kind\":\"config\",\"n_prompt\":{n_prompt},\
          \"n_decode\":{n_decode},\"pairs\":{pairs},\"n_batch\":{batch},\"cpu_expert_activation\":\"{}\",\
-         \"tokens_fnv1a64\":\"{:016x}\"}}",
+         \"compare\":\"{compare}\",\"attention\":\"{}\",\"tokens_fnv1a64\":\"{:016x}\"}}",
         sess.expert_activation().name(),
+        sess.attention().name(),
         fnv1a64(&toks)
     )
     .ok();
@@ -678,15 +696,26 @@ fn ab_attention(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), E
     for ch in toks[..n_prompt].chunks(batch) {
         sess.eval(ch, Logits::None, &never, None)?;
     }
-    writeln!(out, "{{\"kind\":\"prefill\",\"attention\":\"ref\",\"prefill_ns\":{}}}", t0.elapsed().as_nanos()).ok();
+    writeln!(
+        out,
+        "{{\"kind\":\"prefill\",\"attention\":\"{}\",\"q4\":\"ref\",\"prefill_ns\":{}}}",
+        sess.attention().name(),
+        t0.elapsed().as_nanos()
+    )
+    .ok();
     for pair in 0..pairs {
-        let order = if pair % 2 == 0 {
-            [Attention::Reference, Attention::Split]
-        } else {
-            [Attention::Split, Attention::Reference]
-        };
-        for kernel in order {
-            sess.set_attention(kernel)?;
+        // ABBA: arm 0 is the reference kernel, arm 1 the candidate.
+        let order = if pair % 2 == 0 { [0, 1] } else { [1, 0] };
+        for arm in order {
+            let (key, name) = if compare == "q4" {
+                let k = [Q4Kernel::Reference, Q4Kernel::Vec][arm];
+                sess.set_q4_kernel(k);
+                ("q4", k.name())
+            } else {
+                let k = [Attention::Reference, Attention::Split][arm];
+                sess.set_attention(k)?;
+                ("attention", k.name())
+            };
             sess.rewind(n_prompt)?;
             let mut steps = Vec::with_capacity(n_decode);
             let mut top1 = Vec::with_capacity(n_decode);
@@ -699,8 +728,7 @@ fn ab_attention(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), E
             }
             writeln!(
                 out,
-                "{{\"kind\":\"block\",\"pair\":{pair},\"attention\":\"{}\",\"decode_ns\":[{}],\"top1\":[{}]}}",
-                kernel.name(),
+                "{{\"kind\":\"block\",\"pair\":{pair},\"{key}\":\"{name}\",\"decode_ns\":[{}],\"top1\":[{}]}}",
                 steps.join(","),
                 top1.join(",")
             )
