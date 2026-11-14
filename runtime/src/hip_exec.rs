@@ -10,7 +10,8 @@
 //!
 //! Optional instrumentation (R3a.1, [`crate::instr`]) is off by default. Its span boundaries and
 //! the points where the host blocks on queued device work, per layer:
-//! - `attn` and `mlp`: launches only, nothing blocks.
+//! - `attn`, `attn_core`, `attn_out` and `mlp`: launches only, nothing blocks. `attn_core` holds
+//!   the KV store and the attention kernel, the only work whose cost grows with depth.
 //! - `router`: the router-logit download blocks, so in `Mode::Host` this span also carries the
 //!   device time of the layer's attention and shared MLP.
 //! - `select`: host only.
@@ -140,7 +141,7 @@ struct Probe {
 }
 
 /// Span boundaries per layer (at most) and per evaluation, which bound the event pool.
-const BOUNDS_PER_LAYER: usize = 9;
+const BOUNDS_PER_LAYER: usize = 11;
 const BOUNDS_PER_EVAL: usize = 3;
 
 impl Probe {
@@ -628,6 +629,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
         self.emit_dev(obs, "Qcur_pos", ilg, &d.q, n * qd)?;
         self.emit_dev(obs, "Kcur_pos", ilg, &d.k, n * kvd)?;
         self.emit_dev(obs, "Vcur_normed", ilg, &d.v, n * kvd)?;
+        mark(&mut self.probe, Span::AttnCore, il)?;
         hip::kv_store(d.k.f(0), d.v.f(0), dl.k_cache.at(0), dl.v_cache.at(0), n, nkv, hd, p0, dl.cap)?;
         let shape = AttnShape {
             n_tok: n,
@@ -641,6 +643,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
         };
         hip::attention(d.q.f(0), dl.k_cache.at(0), dl.v_cache.at(0), d.attn.f(0), d.scores.f(0), shape)?;
         self.emit_dev(obs, "kqv_out", ilg, &d.attn, n * qd)?;
+        mark(&mut self.probe, Span::AttnOut, il)?;
         hip::q4_mm(dl.wo.at(0), d.attn.f(0), d.o.f(0), e, qd, n)?;
         hip::rms_norm(d.o.f(0), d.o.f(0), Some(dl.post_attn_norm.f(0)), n, e, eps, 1.0)?;
         hip::add(d.o.f(0), d.x.f(0), d.o.f(0), n * e)?;

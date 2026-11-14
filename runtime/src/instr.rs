@@ -100,8 +100,13 @@ pub enum Span {
     Outside,
     /// Token id upload and embedding lookup.
     Embed,
-    /// Attention norm, QKV, RoPE, KV store, attention, output projection, residual.
+    /// Attention norm, Q/K/V projections, head norms and RoPE.
     Attn,
+    /// KV-cache store and the attention kernel (scores, softmax, value sum): the depth-dependent
+    /// part of attention, kept apart from the projections (K1).
+    AttnCore,
+    /// Output projection, post-attention norm and residual.
+    AttnOut,
     /// Shared (dense) MLP.
     Mlp,
     /// Router norm and logits, plus their readback (the layer's first blocking point).
@@ -127,10 +132,12 @@ pub enum Span {
 }
 
 impl Span {
-    pub const ALL: [Span; 14] = [
+    pub const ALL: [Span; 16] = [
         Span::Outside,
         Span::Embed,
         Span::Attn,
+        Span::AttnCore,
+        Span::AttnOut,
         Span::Mlp,
         Span::Router,
         Span::Select,
@@ -149,6 +156,8 @@ impl Span {
             Span::Outside => "outside",
             Span::Embed => "embed",
             Span::Attn => "attn",
+            Span::AttnCore => "attn_core",
+            Span::AttnOut => "attn_out",
             Span::Mlp => "mlp",
             Span::Router => "router",
             Span::Select => "select",
@@ -201,6 +210,9 @@ pub struct Instr {
 }
 
 const MAX_EVAL_SAMPLES: usize = 1 << 16;
+
+/// Spans recorded per layer: `attn` through `combine` in [`Span::ALL`].
+const PER_LAYER_SPANS: usize = 12;
 
 impl Instr {
     /// `max_bounds` bounds the span boundaries of one evaluation.
@@ -468,18 +480,18 @@ impl Instr {
         o
     }
 
-    /// Per-layer host and device milliseconds per evaluation, one line per layer, spans in
-    /// [`Span::ALL`] order (columns with no samples print 0).
+    /// Per-layer host and device milliseconds per evaluation, one line per layer, the per-layer
+    /// spans (`attn` through `combine`) in [`Span::ALL`] order (columns with no samples print 0).
     pub fn per_layer(&self) -> String {
         let ev = self.evals.max(1) as f64;
         let mut o = String::from("layer");
-        for s in Span::ALL.iter().skip(2).take(10) {
+        for s in Span::ALL.iter().skip(2).take(PER_LAYER_SPANS) {
             let _ = write!(o, " {}", s.name());
         }
         o.push('\n');
         for l in 0..self.n_layers {
             let _ = write!(o, "{l}");
-            for &s in Span::ALL.iter().skip(2).take(10) {
+            for &s in Span::ALL.iter().skip(2).take(PER_LAYER_SPANS) {
                 let st = self.stat(s, l);
                 let _ = write!(o, " {:.4}/{:.4}", st.host_ns as f64 / 1e6 / ev, st.dev_ns as f64 / 1e6 / ev);
             }
