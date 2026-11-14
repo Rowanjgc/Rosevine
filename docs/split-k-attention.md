@@ -3,10 +3,10 @@
 Date: 2026-11-13. Bead: rv-e05-7n3.3 (K3), activated by the maintainer on
 2026-11-13 after K1 ([prefill and decode attribution](prefill-attribution.md)).
 Scope: parity-plan record [G1](parity-plan.md#g1-decode-attention-at-depth-existing-k3-rv-e05-7n33).
-Status: **measured; performance criteria met, two pre-recorded correctness
-criteria not met** (2b and 3). A diagnostic finds no defect. The kernel stays
-opt-in, and adopting it is a maintainer decision. The criteria section is
-unchanged from its pre-measurement commit (`692b7df`). Raw captures, commands
+Status: **adopted as the default by maintainer decision** (2026-11-13).
+Performance criteria were met; two pre-recorded correctness criteria (2b and 3)
+were not, and a diagnostic finds no defect. The criteria section is unchanged
+from its pre-measurement commit (`692b7df`). Raw captures, commands
 and hashes stay private.
 
 ## Change
@@ -113,6 +113,9 @@ were set before measurement and are reported as not met.
   - Inside the project's KL band against both frozen references.
   - Outside the tighter kernel-to-kernel criteria recorded for K3.
   - No defect found; the new kernel is closer to exact.
-- The kernel stays **opt-in** (`--attention split`). Making it the default, and
-  whether criteria 2b and 3 should be judged against exact attention rather than
-  the old kernel, are decisions for the maintainer at Gate 4.
+- **Maintainer decision (2026-11-13): adopt as the default.** The deviation from
+  criteria 2b and 3 is accepted on the evidence above: inside the KL band, and
+  closer to exact attention than the reference kernel. The criteria are not
+  rewritten; this record keeps them as not met. The R2 reference kernel stays
+  available as `--attention ref` (`Attention::Reference`).
+- This is a K3 outcome, not a Gate 4 claim. Gate 4 still waits for K2.

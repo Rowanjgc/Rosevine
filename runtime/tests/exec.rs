@@ -426,7 +426,8 @@ mod hip_synthetic {
         let m = model(&PATTERN_HIP, 11);
         let w = weights(&m);
         let toks = tokens(32, 9);
-        let reference = run(&mut HipSession::new(&w, hip_cfg(2)).unwrap(), &toks);
+        let ref_cfg = || HipConfig { attention: Attention::Reference, ..hip_cfg(2) };
+        let reference = run(&mut HipSession::new(&w, ref_cfg()).unwrap(), &toks);
         let rel = |a: &[f32]| {
             let num: f64 = a.iter().zip(&reference).map(|(x, y)| f64::from(x - y).powi(2)).sum();
             let den: f64 = reference.iter().map(|y| f64::from(*y).powi(2)).sum();
@@ -436,7 +437,7 @@ mod hip_synthetic {
         let a = run(&mut split, &toks);
         assert!(rel(&a) < 1e-4, "split session rel {}", rel(&a));
         assert!(split.set_attention(Attention::Reference).is_err());
-        let mut switched = HipSession::new(&w, hip_cfg(2)).unwrap();
+        let mut switched = HipSession::new(&w, ref_cfg()).unwrap();
         switched.set_attention(Attention::Split).unwrap();
         let b = run(&mut switched, &toks);
         assert_eq!(digest(&a), digest(&b), "a switched session runs the same split kernel");

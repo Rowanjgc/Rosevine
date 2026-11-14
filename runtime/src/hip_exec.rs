@@ -43,7 +43,8 @@ pub struct HipConfig {
     pub max_vram: usize,
     /// Device bytes that must remain free after allocation (for other processes).
     pub vram_reserve: usize,
-    /// Attention kernel. The reference kernel stays the default until K3's gate review.
+    /// Attention kernel. Split-K is the default since the maintainer adopted it after K3
+    /// (docs/split-k-attention.md); the R2 reference kernel stays selectable.
     pub attention: Attention,
 }
 
@@ -51,9 +52,9 @@ pub struct HipConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Attention {
     /// One block per query-head (R2), with `max_batch * n_head * max_ctx` floats of score scratch.
-    #[default]
     Reference,
     /// Split-K online softmax ([`hip::attention_split`]); scratch independent of `max_ctx`.
+    #[default]
     Split,
 }
 
