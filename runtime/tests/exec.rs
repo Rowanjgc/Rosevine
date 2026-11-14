@@ -447,6 +447,50 @@ mod hip_synthetic {
         assert_eq!(digest(&run(&mut switched, &toks)), digest(&reference));
     }
 
+    /// K1b/S1 verification shape: a 4-row batch with all logits (sampled token plus three drafts)
+    /// gives each row the logits sequential decode gives it, up to batch summation order; after
+    /// rejecting rows with the bounded rewind, decoding resumes as if they had never been evaluated.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn verification_rows_and_rollback_match_sequential_decode() {
+        hip::init(0).unwrap();
+        let m = model(&PATTERN_HIP, 11);
+        let w = weights(&m);
+        let toks = tokens(32, 9);
+        let vocab = VOCAB;
+        let rel = |a: &[f32], b: &[f32]| {
+            let num: f64 = a.iter().zip(b).map(|(x, y)| f64::from(x - y).powi(2)).sum();
+            let den: f64 = b.iter().map(|y| f64::from(*y).powi(2)).sum();
+            (num / den).sqrt()
+        };
+        // Sequential reference: logits after each of toks[0..24].
+        let mut seq = HipSession::new(&w, hip_cfg(2)).unwrap();
+        let reference = run(&mut seq, &toks[..24]);
+        // Prefill 12, then verify toks[12..16] in one 4-row batch.
+        let mut v = HipSession::new(&w, hip_cfg(2)).unwrap();
+        v.eval(&toks[..12], Logits::None, &NEVER, None).unwrap();
+        let rows = v.eval(&toks[12..16], Logits::All, &NEVER, None).unwrap().to_vec();
+        for j in 0..4 {
+            let want = &reference[(12 + j) * vocab..(13 + j) * vocab];
+            let e = rel(&rows[j * vocab..(j + 1) * vocab], want);
+            assert!(e < 1e-4, "verification row {j}: rel {e}");
+        }
+        // Accept one draft (keep rows 0 and 1), reject two, then decode toks[14..24] one at a time.
+        v.rewind(14).unwrap();
+        for (k, &t) in toks[14..24].iter().enumerate() {
+            let got = v.eval(&[t], Logits::Last, &NEVER, None).unwrap();
+            let want = &reference[(14 + k) * vocab..(15 + k) * vocab];
+            assert!(rel(got, want) < 1e-4, "resume step {k}: rel {}", rel(got, want));
+        }
+        // Rejecting every draft (keep row 0 only) also resumes cleanly.
+        let mut z = HipSession::new(&w, hip_cfg(2)).unwrap();
+        z.eval(&toks[..12], Logits::None, &NEVER, None).unwrap();
+        z.eval(&toks[12..16], Logits::All, &NEVER, None).unwrap();
+        z.rewind(13).unwrap();
+        let got = z.eval(&[toks[13]], Logits::Last, &NEVER, None).unwrap();
+        assert!(rel(got, &reference[13 * vocab..14 * vocab]) < 1e-4);
+    }
+
     /// K2: the quarter-block Q4_0 kernel gives the reference kernel's logits up to summation
     /// order, end to end, and switching back restores the reference bitwise.
     #[test]

@@ -11,10 +11,12 @@
 //!                                                     # stdin: prompt token ids
 //! rosevine-inspect replay   <gguf> --n-prompt P --n-decode D [--reps R] [--batch B] [--threads T] [--ctx C]
 //!                           [--instr MODE] [--instr-prefill MODE] [--instr-per-layer] [--attention ref|split]
-//!                           [--q4 ref|vec]
+//!                           [--q4 ref|vec] [--verify-width W [--verify-accept A]]
 //!                                                     # stdin: P + D frozen token ids (parity P1)
 //! rosevine-inspect ab-attention <gguf> --n-prompt P --n-decode D --pairs K [--compare attention|q4] [--batch B] [--threads T]
 //!                                                     # stdin: P + D frozen token ids (K3/K2, hip only)
+//! rosevine-inspect verify-sweep <gguf> --n-prompt P --n-decode D [--reps R] [--instr MODE] [--instr-per-layer]
+//!                                                     # stdin: P + D frozen token ids (K1b, hip only)
 //! ```
 //!
 //! `kld`, `generate`, `replay` and `dump` take `--backend cpu|hip` (hip needs the `hip` feature) with
@@ -165,6 +167,8 @@ fn run(args: &[String]) -> Result<(), Error> {
         "replay" => replay(args, &g, &mut out)?,
         #[cfg(feature = "hip")]
         "ab-attention" => ab_attention(args, &g, &mut out)?,
+        #[cfg(feature = "hip")]
+        "verify-sweep" => verify_sweep(args, &g, &mut out)?,
         "dump" => dump(args, &g)?,
         _ => return Err(Error::UnsupportedInput("unknown command")),
     }
@@ -255,6 +259,14 @@ impl<'w, 'a> Exec<'w, 'a> {
             Exec::Cpu(s) => s.eval(toks, want, cancel, obs),
             #[cfg(feature = "hip")]
             Exec::Hip(s) => s.eval(toks, want, cancel, obs),
+        }
+    }
+
+    fn rewind(&mut self, n: usize) -> Result<(), Error> {
+        match self {
+            Exec::Cpu(s) => s.rewind(n),
+            #[cfg(feature = "hip")]
+            Exec::Hip(s) => s.rewind(n),
         }
     }
 
@@ -554,6 +566,14 @@ fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> 
     if n_prompt == 0 || !(1..=1000).contains(&reps) {
         return Err(Error::UnsupportedInput("--n-prompt must be positive and --reps 1..=1000"));
     }
+    // K1b verification shape: each decode step evaluates `width` frozen ids with all logits (the
+    // sampled token plus width - 1 drafts, as the pinned MTP verifier batches them), keeps the
+    // first `accept + 1` rows and rewinds the rest. Width 1 is ordinary decode.
+    let width: usize = opt(args, "--verify-width").unwrap_or(1);
+    let accept: usize = opt(args, "--verify-accept").unwrap_or(width.saturating_sub(1));
+    if !(1..=8).contains(&width) || accept >= width || width > n_decode.max(1) {
+        return Err(Error::UnsupportedInput("--verify-width 1..=8 and <= --n-decode; --verify-accept below it"));
+    }
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     let mut toks = Vec::new();
@@ -576,7 +596,7 @@ fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> 
          \"backend\":\"{backend}\",\"n_prompt\":{n_prompt},\"n_decode\":{n_decode},\"reps\":{reps},\
          \"n_ctx\":{ctx},\"n_batch\":{batch},\"n_ubatch\":{batch},\"threads\":{threads},\
          \"cpu_moe_layers\":{cpu_moe},\"kv_type\":\"q8_0\",\"cpu_expert_activation\":\"{}\",\
-         \"expert_kernel\":\"{}\",\"expert_wait\":\"{}\",\"attention\":\"{}\",\"q4\":\"{}\",\"tokens_fnv1a64\":\"{:016x}\"}}",
+         \"expert_kernel\":\"{}\",\"expert_wait\":\"{}\",\"attention\":\"{}\",\"q4\":\"{}\",\"verify_width\":{width},\"verify_accept\":{accept},\"tokens_fnv1a64\":\"{:016x}\"}}",
         sess.expert_activation().name(),
         opt::<String>(args, "--expert-kernel").unwrap_or_else(|| "auto".into()),
         opt::<String>(args, "--expert-wait").unwrap_or_else(|| "sleep".into()),
@@ -606,17 +626,8 @@ fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> 
             sess.report_phase("prefill", prefill_ns as f64 / 1e9, Some(n_prompt), args);
         }
         sess.instrument(args)?;
-        let mut steps = Vec::with_capacity(n_decode);
-        let mut top1 = Vec::with_capacity(n_decode);
         let t1 = Instant::now();
-        for &t in &toks[n_prompt..] {
-            let s = Instant::now();
-            let lg = sess.eval(&[t], Logits::Last, &never, None)?;
-            std::hint::black_box(lg.first());
-            steps.push(s.elapsed().as_nanos().to_string());
-            // Correctness record only; computed after the timed span closes.
-            top1.push(argmax(lg).to_string());
-        }
+        let (steps, top1) = verify_steps(&mut sess, &toks, n_prompt, width, accept)?;
         sess.report_instrumentation(t1.elapsed().as_secs_f64(), args);
         writeln!(
             out,
@@ -628,6 +639,112 @@ fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> 
         )
         .ok();
         out.flush().ok();
+    }
+    Ok(())
+}
+
+/// Feed `toks[start..]` as verification steps of `width` rows from position `start` (the session
+/// must hold exactly `start` positions), keeping `accept + 1` rows per step. Returns per-step
+/// nanoseconds and the top-1 id of each step's last kept row (computed outside the timed span).
+fn verify_steps(
+    sess: &mut Exec,
+    toks: &[u32],
+    start: usize,
+    width: usize,
+    accept: usize,
+) -> Result<(Vec<String>, Vec<String>), Error> {
+    let never = || false;
+    let (mut steps, mut top1) = (Vec::new(), Vec::new());
+    let mut i = start;
+    while i + width <= toks.len() {
+        let s = Instant::now();
+        let lg = sess.eval(&toks[i..i + width], if width == 1 { Logits::Last } else { Logits::All }, &never, None)?;
+        std::hint::black_box(lg.first());
+        steps.push(s.elapsed().as_nanos().to_string());
+        let row = if width == 1 { lg } else { &lg[accept * lg.len() / width..][..lg.len() / width] };
+        top1.push(argmax(row).to_string());
+        // Rejected rows: the bounded rewind only moves the position (no device work).
+        if accept + 1 < width {
+            sess.rewind(i + accept + 1)?;
+        }
+        i += accept + 1;
+    }
+    Ok((steps, top1))
+}
+
+/// K1b verification-width sweep (HIP only): prefill the first `P` frozen ids once, then for each
+/// repetition rewind to `P` and feed the next `D` ids as verification steps for each (width,
+/// accept) shape in a rotating order. `--instr MODE` instruments every block separately and prints
+/// a `phase=w<W>a<A>` summary per block; stdout carries one JSON line per block.
+#[cfg(feature = "hip")]
+fn verify_sweep(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> {
+    const SHAPES: [(usize, usize); 5] = [(1, 0), (2, 1), (3, 2), (4, 3), (4, 0)];
+    let n_prompt: usize = opt(args, "--n-prompt").ok_or(Error::UnsupportedInput("--n-prompt required"))?;
+    let n_decode: usize = opt(args, "--n-decode").ok_or(Error::UnsupportedInput("--n-decode required"))?;
+    let reps: usize = opt(args, "--reps").unwrap_or(1);
+    if n_prompt == 0 || n_decode < 4 || !(1..=100).contains(&reps) {
+        return Err(Error::UnsupportedInput("--n-prompt positive, --n-decode at least 4, --reps 1..=100"));
+    }
+    if opt::<String>(args, "--backend").as_deref() != Some("hip") {
+        return Err(Error::UnsupportedInput("verify-sweep needs --backend hip"));
+    }
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let mut toks = Vec::new();
+    for t in line.split_whitespace() {
+        toks.push(t.parse::<u32>().map_err(|_| Error::UnsupportedInput("malformed token id"))?);
+    }
+    if toks.len() < n_prompt + n_decode {
+        return Err(Error::UnsupportedInput("token input shorter than prompt plus decode"));
+    }
+    toks.truncate(n_prompt + n_decode);
+    let w = Weights::bind(g)?;
+    let cfg = exec_config(args, n_prompt + n_decode, 64);
+    if n_decode > cfg.max_batch + 1 {
+        return Err(Error::UnsupportedInput("--n-decode exceeds the rewindable span (batch + 1)"));
+    }
+    let batch = cfg.max_batch;
+    let mut sess = Exec::new(args, &w, cfg)?;
+    writeln!(
+        out,
+        "{{\"schema\":\"rosevine-verify-sweep-v1\",\"kind\":\"config\",\"n_prompt\":{n_prompt},\
+         \"n_decode\":{n_decode},\"reps\":{reps},\"n_batch\":{batch},\"cpu_expert_activation\":\"{}\",\
+         \"instr\":\"{}\",\"tokens_fnv1a64\":\"{:016x}\"}}",
+        sess.expert_activation().name(),
+        opt::<String>(args, "--instr").unwrap_or_else(|| "off".into()),
+        fnv1a64(&toks)
+    )
+    .ok();
+    let never = || false;
+    let t0 = Instant::now();
+    for ch in toks[..n_prompt].chunks(batch) {
+        sess.eval(ch, Logits::None, &never, None)?;
+    }
+    writeln!(out, "{{\"kind\":\"prefill\",\"prefill_ns\":{}}}", t0.elapsed().as_nanos()).ok();
+    for rep in 0..reps {
+        let mut order: Vec<_> = SHAPES.iter().copied().cycle().skip(rep % SHAPES.len()).take(SHAPES.len()).collect();
+        if rep % 2 == 1 {
+            order.reverse();
+        }
+        for (width, accept) in order {
+            sess.rewind(n_prompt)?;
+            sess.instrument(args)?;
+            let t1 = Instant::now();
+            let (steps, top1) = verify_steps(&mut sess, &toks, n_prompt, width, accept)?;
+            let loop_s = t1.elapsed().as_secs_f64();
+            if opt::<String>(args, "--instr").is_some() {
+                sess.report_phase(&format!("w{width}a{accept}"), loop_s, Some(steps.len()), args);
+            }
+            writeln!(
+                out,
+                "{{\"kind\":\"block\",\"rep\":{rep},\"width\":{width},\"accept\":{accept},\"step_ns\":[{}],\
+                 \"top1\":[{}]}}",
+                steps.join(","),
+                top1.join(",")
+            )
+            .ok();
+            out.flush().ok();
+        }
     }
     Ok(())
 }
