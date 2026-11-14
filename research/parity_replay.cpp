@@ -11,6 +11,7 @@
 // --validate-only TOKENS N_PROMPT N_DECODE checks the input without loading a backend.
 // --run MODEL TOKENS N_PROMPT N_DECODE REPS CTX BATCH UBATCH THREADS CPU_MOE KV FA REPACK
 // CPU_MOE: a layer count N (layers 0..N-1) or an explicit list L:a,b,c
+// Optional MOE_CACHE_MIB DECODE_CHUNK: pinned experimental MoE cache size, fixed tokens per decode call
 // loads weights and MUST be externally supervised in a reviewed run window.
 // Output: one JSON config line, then one JSON line per repetition (stdout).
 #include "llama.h"
@@ -48,6 +49,8 @@ void log_callback(ggml_log_level level, const char * text, void *) {
         g_override_layers.insert(layer);
         ++g_override_tensors;
     }
+    // MoE cache sizing and teardown hit/miss counters carry no paths; pass them through.
+    if (text && (std::strstr(text, "llama_moe_cache") || std::strstr(text, "MoE cache"))) fputs(text, stderr);
     if (level == GGML_LOG_LEVEL_ERROR) fputs("native error (detail withheld)\n", stderr);
 }
 
@@ -129,8 +132,8 @@ void eval_span(llama_context * ctx, const std::vector<llama_token> & toks, long 
     llama_batch_free(batch);
 }
 
-int argmax(llama_context * ctx, const llama_vocab * vocab) {
-    const float * lg = llama_get_logits_ith(ctx, -1);
+int argmax_ith(llama_context * ctx, const llama_vocab * vocab, int32_t i) {
+    const float * lg = llama_get_logits_ith(ctx, i);
     if (!lg) throw std::runtime_error("missing output logits");
     const int32_t n = llama_vocab_n_tokens(vocab);
     int32_t best = 0;
@@ -140,7 +143,32 @@ int argmax(llama_context * ctx, const llama_vocab * vocab) {
     return best;
 }
 
-void run(char ** a) {
+int argmax(llama_context * ctx, const llama_vocab * vocab) {
+    return argmax_ith(ctx, vocab, -1);
+}
+
+// One decode call over k fixed tokens with logits at every position (k = 1 is ordinary decode).
+void eval_chunk(llama_context * ctx, const std::vector<llama_token> & toks, long from, long k) {
+    llama_batch batch = llama_batch_init(static_cast<int32_t>(k), 0, 1);
+    try {
+        batch.n_tokens = static_cast<int32_t>(k);
+        for (long i = 0; i < k; ++i) {
+            batch.token[i] = toks[static_cast<size_t>(from + i)];
+            batch.pos[i] = static_cast<llama_pos>(from + i);
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i] = 1;
+        }
+        if (llama_decode(ctx, batch) != 0) throw std::runtime_error("decode failed");
+        llama_synchronize(ctx);
+    } catch (...) {
+        llama_batch_free(batch);
+        throw;
+    }
+    llama_batch_free(batch);
+}
+
+void run(const char * const * a) {
     const char * model_path = a[0];
     const long n_prompt = parse_count(a[2], 1, 1 << 20);
     const long n_decode = parse_count(a[3], 0, 1 << 16);
@@ -174,6 +202,10 @@ void run(char ** a) {
     }
     const long cpu_moe = static_cast<long>(cpu_layers.size());
     const std::string kv = a[10], fa = a[11], repack = a[12];
+    // Optional: MOE_CACHE_MIB (pinned experimental --moe-cache-mib) and DECODE_CHUNK, the number
+    // of fixed tokens evaluated per decode call (k > 1 approximates fully accepted MTP verification).
+    const long moe_cache_mib = a[13] ? parse_count(a[13], 0, 1 << 16) : 0;
+    const long decode_chunk = a[13] ? parse_count(a[14], 1, 32) : 1;
     if ((kv != "q8_0" && kv != "f16") || (fa != "on" && fa != "off") || (repack != "on" && repack != "off")) {
         throw std::runtime_error("kv must be q8_0|f16, fa on|off, repack on|off");
     }
@@ -211,7 +243,7 @@ void run(char ** a) {
     cp.n_threads = cp.n_threads_batch = static_cast<int32_t>(threads);
     cp.flash_attn_type = fa == "on" ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cp.type_k = cp.type_v = kv == "q8_0" ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
-    cp.moe_cache_size = 0;
+    cp.moe_cache_size = static_cast<size_t>(moe_cache_mib) * 1024 * 1024;
     cp.no_perf = true;
     std::unique_ptr<llama_context, decltype(&llama_free)> context(
         llama_init_from_model(model.get(), cp), llama_free);
@@ -231,10 +263,11 @@ void run(char ** a) {
            "\"n_prompt\":%ld,\"n_decode\":%ld,\"reps\":%ld,\"n_ctx\":%u,\"n_batch\":%u,\"n_ubatch\":%u,"
            "\"threads\":%ld,\"cpu_moe_layers\":%ld,\"cpu_moe_layer_list\":\"%s\",\"override_layers\":\"%s\",\"override_tensors\":%ld,\"kv_type\":\"%s\",\"flash_attn\":\"%s\","
            "\"cpu_repack\":\"%s\",\"cpu_expert_activation\":\"q8_0\",\"swa_full\":%s,\"op_offload\":%s,"
-           "\"tokens_fnv1a64\":\"%016llx\",\"buffers\":[%s]}\n",
+           "\"moe_cache_mib\":%ld,\"decode_chunk\":%ld,\"tokens_fnv1a64\":\"%016llx\",\"buffers\":[%s]}\n",
            n_prompt, n_decode, reps, llama_n_ctx(ctx), llama_n_batch(ctx), llama_n_ubatch(ctx), threads,
            cpu_moe, layer_list.c_str(), override_list.c_str(), g_override_tensors, kv.c_str(), fa.c_str(), repack.c_str(), cp.swa_full ? "true" : "false",
-           cp.op_offload ? "true" : "false", static_cast<unsigned long long>(fnv1a64(toks)), buffers.c_str());
+           cp.op_offload ? "true" : "false", moe_cache_mib, decode_chunk, static_cast<unsigned long long>(fnv1a64(toks)),
+           buffers.c_str());
     fflush(stdout);
     for (long r = 0; r < reps; ++r) {
         llama_memory_clear(llama_get_memory(ctx), true);
@@ -242,17 +275,23 @@ void run(char ** a) {
         eval_span(ctx, toks, 0, n_prompt, n_batch);
         const int64_t prefill_ns = now_ns() - t0;
         const int prefill_top1 = argmax(ctx, vocab);
-        std::string steps, top1;
-        for (long i = 0; i < n_decode; ++i) {
+        std::string steps, top1, chunks;
+        for (long i = 0; i < n_decode; i += decode_chunk) {
+            const long k = std::min(decode_chunk, n_decode - i);
             const int64_t s = now_ns();
-            eval_span(ctx, toks, n_prompt + i, n_prompt + i + 1, 1);
-            steps += (i ? "," : "") + std::to_string(now_ns() - s);
-            // Correctness record only; computed after the timed span closes.
-            top1 += (i ? "," : "") + std::to_string(argmax(ctx, vocab));
+            eval_chunk(ctx, toks, n_prompt + i, k);
+            const int64_t ns = now_ns() - s;
+            chunks += (i ? "," : "") + std::to_string(ns);
+            for (long j = 0; j < k; ++j) {
+                // A chunk's time is attributed evenly to its tokens; chunk_ns keeps the raw spans.
+                steps += (i + j ? "," : "") + std::to_string(std::max<int64_t>(1, ns / k));
+                // Correctness record only; computed after the timed span closes.
+                top1 += (i + j ? "," : "") + std::to_string(argmax_ith(ctx, vocab, static_cast<int32_t>(j)));
+            }
         }
         printf("{\"schema\":\"rosevine-parity-replay-v1\",\"kind\":\"rep\",\"rep\":%ld,"
-               "\"prefill_ns\":%lld,\"decode_ns\":[%s],\"prefill_top1\":%d,\"top1\":[%s]}\n",
-               r, static_cast<long long>(prefill_ns), steps.c_str(), prefill_top1, top1.c_str());
+               "\"prefill_ns\":%lld,\"decode_ns\":[%s],\"chunk_ns\":[%s],\"prefill_top1\":%d,\"top1\":[%s]}\n",
+               r, static_cast<long long>(prefill_ns), steps.c_str(), chunks.c_str(), prefill_top1, top1.c_str());
         fflush(stdout);
     }
     context.reset();
@@ -269,11 +308,13 @@ int main(int argc, char ** argv) {
                    static_cast<unsigned long long>(fnv1a64(toks)));
             return 0;
         }
-        if (argc != 15 || std::string(argv[1]) != "--run") {
+        if ((argc != 15 && argc != 17) || std::string(argv[1]) != "--run") {
             throw std::runtime_error("usage: --validate-only TOKENS N_PROMPT N_DECODE | --run MODEL TOKENS "
-                                     "N_PROMPT N_DECODE REPS CTX BATCH UBATCH THREADS CPU_MOE KV FA REPACK");
+                                     "N_PROMPT N_DECODE REPS CTX BATCH UBATCH THREADS CPU_MOE KV FA REPACK [MOE_CACHE_MIB DECODE_CHUNK]");
         }
-        run(argv + 2);
+        const char * args[15] = {};
+        for (int i = 2; i < argc; ++i) args[i - 2] = argv[i];
+        run(args);
         return 0;
     } catch (const std::exception & e) {
         fprintf(stderr, "parity replay failed: %s\n", e.what());

@@ -161,7 +161,10 @@ rosevine-inspect replay MODEL --backend hip --n-prompt P --n-decode D --reps R -
 either a count `N` (layers `0..N-1`) or an explicit list `L:a,b,c` for
 noncontiguous static placement controls. The adapter rejects duplicate or empty
 entries and layers outside the model. Its config row reports the loader's own
-override notices (`override_layers`, `override_tensors`) as a placement readback.
+override notices (`override_layers`, `override_tensors`) as a placement readback. Two optional final
+arguments, `MOE_CACHE_MIB DECODE_CHUNK`, enable the pin's experimental MoE cache
+and fixed-token chunked decode ([MoE cache audit](moe-cache-audit.md)). Both default
+to off and 1, so parity cells are unchanged.
 `--run` and the Rosevine command load weights. Run them only under
 `gpu_campaign` supervision, inside a reviewed run window.
 
