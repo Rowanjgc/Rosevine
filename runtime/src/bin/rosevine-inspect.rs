@@ -11,9 +11,10 @@
 //!                                                     # stdin: prompt token ids
 //! rosevine-inspect replay   <gguf> --n-prompt P --n-decode D [--reps R] [--batch B] [--threads T] [--ctx C]
 //!                           [--instr MODE] [--instr-prefill MODE] [--instr-per-layer] [--attention ref|split]
+//!                           [--q4 ref|vec]
 //!                                                     # stdin: P + D frozen token ids (parity P1)
 //! rosevine-inspect ab-attention <gguf> --n-prompt P --n-decode D --pairs K [--compare attention|q4] [--batch B] [--threads T]
-//!                                                     # stdin: P + D frozen token ids (K3, hip only)
+//!                                                     # stdin: P + D frozen token ids (K3/K2, hip only)
 //! ```
 //!
 //! `kld`, `generate`, `replay` and `dump` take `--backend cpu|hip` (hip needs the `hip` feature) with
