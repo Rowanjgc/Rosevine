@@ -39,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cpu_expert_layers: n,
         max_vram: 14 << 30,
         vram_reserve: 1 << 30,
+        attention: Default::default(),
     };
     let need = HipSession::device_bytes_needed(&w, &cfg).ok_or("size overflow")?;
     println!("configuration N={n} threads={th} prompt={} device_bytes={need}", tokens.len());

@@ -245,6 +245,108 @@ __global__ void k_attention(const float *q, const uint8_t *kc, const uint8_t *vc
     }
 }
 
+// Split-K attention (K3). The keys [lo, pos] of each query are cut into `n_chunks` contiguous
+// chunks; block (query-head i, chunk c) runs an online softmax over its chunk in tiles of ATT_TILE
+// keys. With one chunk it writes the normalized output; otherwise an unnormalized partial
+// (max, sum, acc[hd]) for k_attn_combine. Scores are formed one warp per key with the lanes across
+// the head dimension, so K rows are read contiguously; each thread then owns output dimensions
+// threadIdx.x and threadIdx.x + ATT_TILE (hd <= 2 * ATT_TILE). Same scale (1.0), mask and Q8_0
+// cache as k_attention; only the summation order differs.
+constexpr int ATT_TILE = 256;  // keys per tile; equals blockDim.x
+__global__ void k_attn_split(const float *q, const uint8_t *kc, const uint8_t *vc, float *out, float *part,
+                             int n_head, int n_kv, int hd, int p0, int cap, int window, int n_chunks) {
+    __shared__ float sh[32];
+    __shared__ float qs[2 * ATT_TILE];
+    __shared__ float p[ATT_TILE];
+    const int i = blockIdx.x, c = blockIdx.y;
+    const int t = i / n_head, h = i % n_head;
+    const int g = h / (n_head / n_kv);
+    const int pos = p0 + t;
+    const int lo = window > 0 ? max(0, pos + 1 - window) : 0;
+    const int len = pos - lo + 1;
+    const int per = (len + n_chunks - 1) / n_chunks;
+    const int k0 = lo + c * per, k1 = min(pos + 1, k0 + per);
+    const int row = hd / QK * Q8_BLOCK;
+    const int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize, nw = blockDim.x / warpSize;
+    const int d0 = threadIdx.x, d1 = threadIdx.x + ATT_TILE;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) qs[d] = q[(size_t)i * hd + d];
+    __syncthreads();
+    float acc0 = 0.f, acc1 = 0.f, m = -INFINITY, l = 0.f;
+    for (int base = k0; base < k1; base += ATT_TILE) {
+        const int nt = min(ATT_TILE, k1 - base);
+        for (int j = wid; j < nt; j += nw) {
+            const uint8_t *kr = kc + ((size_t)((base + j) % cap) * n_kv + g) * row;
+            float s = 0.f;
+            for (int d = lane; d < hd; d += warpSize) {
+                const uint8_t *blk = kr + (d / QK) * Q8_BLOCK;
+                s += f16(blk) * (float)(int8_t)blk[2 + d % QK] * qs[d];
+            }
+            s = warp_sum(s);
+            if (lane == 0) p[j] = s;
+        }
+        __syncthreads();
+        const float tm = block_max(threadIdx.x < nt ? p[threadIdx.x] : -INFINITY, sh);
+        const float mn = fmaxf(m, tm);
+        const float e = threadIdx.x < nt ? expf(p[threadIdx.x] - mn) : 0.f;
+        const float ts = block_sum(e, sh);
+        if (threadIdx.x < nt) p[threadIdx.x] = e;
+        __syncthreads();
+        const float corr = expf(m - mn);  // 0 on the first tile, where m is -inf
+        l = l * corr + ts;
+        acc0 *= corr;
+        acc1 *= corr;
+        if (d0 < hd) {
+            const int bo = (d0 / QK) * Q8_BLOCK, eo = 2 + d0 % QK;
+            for (int j = 0; j < nt; ++j) {
+                const uint8_t *blk = vc + ((size_t)((base + j) % cap) * n_kv + g) * row + bo;
+                acc0 += p[j] * f16(blk) * (float)(int8_t)blk[eo];
+            }
+        }
+        if (d1 < hd) {
+            const int bo = (d1 / QK) * Q8_BLOCK, eo = 2 + d1 % QK;
+            for (int j = 0; j < nt; ++j) {
+                const uint8_t *blk = vc + ((size_t)((base + j) % cap) * n_kv + g) * row + bo;
+                acc1 += p[j] * f16(blk) * (float)(int8_t)blk[eo];
+            }
+        }
+        m = mn;
+        __syncthreads();  // p is rewritten by the next tile
+    }
+    if (n_chunks == 1) {
+        const float inv = 1.0f / l;
+        if (d0 < hd) out[(size_t)i * hd + d0] = acc0 * inv;
+        if (d1 < hd) out[(size_t)i * hd + d1] = acc1 * inv;
+        return;
+    }
+    float *pp = part + ((size_t)i * n_chunks + c) * (hd + 2);
+    if (threadIdx.x == 0) {
+        pp[0] = m;
+        pp[1] = l;
+    }
+    if (d0 < hd) pp[2 + d0] = acc0;
+    if (d1 < hd) pp[2 + d1] = acc1;
+}
+
+// Merge the per-chunk partials of each query-head: out = sum_c e^(m_c - M) acc_c / sum_c e^(m_c - M) l_c.
+// Empty chunks carry m = -inf and l = 0 and contribute nothing.
+__global__ void k_attn_combine(const float *part, float *out, int hd, int n_chunks) {
+    const int i = blockIdx.x;
+    const float *pp = part + (size_t)i * n_chunks * (hd + 2);
+    float mx = -INFINITY;
+    for (int c = 0; c < n_chunks; ++c) mx = fmaxf(mx, pp[(size_t)c * (hd + 2)]);
+    float den = 0.f;
+    for (int c = 0; c < n_chunks; ++c) den += expf(pp[(size_t)c * (hd + 2)] - mx) * pp[(size_t)c * (hd + 2) + 1];
+    const float inv = 1.0f / den;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float o = 0.f;
+        for (int c = 0; c < n_chunks; ++c) {
+            const float *q = pp + (size_t)c * (hd + 2);
+            o += expf(q[0] - mx) * q[2 + d];
+        }
+        out[(size_t)i * hd + d] = o * inv;
+    }
+}
+
 __device__ __forceinline__ float gelu(float x) {
     const float a = 0.044715f, c = 0.7978845608f;
     return 0.5f * x * (1.0f + tanhf(c * x * (1.0f + a * x * x)));
@@ -420,6 +522,24 @@ int rvh_attention(const float *q, const void *kc, const void *vc, float *out, fl
     CHECK_DIMS(longest <= max_keys && longest <= cap);
     hipLaunchKernelGGL(k_attention, dim3(n_tok * n_head), dim3(256), 0, 0, q, (const uint8_t *)kc,
                        (const uint8_t *)vc, out, scores, n_head, n_kv, hd, p0, cap, window, max_keys);
+    return launched();
+}
+
+int rvh_attn_split(const float *q, const void *kc, const void *vc, float *out, float *part, int n_tok, int n_head,
+                   int n_kv, int hd, int p0, int cap, int window, int n_chunks) {
+    CHECK_DIMS(q && kc && vc && out && n_tok > 0 && n_kv > 0 && n_head % n_kv == 0 && hd % QK == 0 &&
+               hd <= 2 * ATT_TILE && p0 >= 0 && cap > 0 && window >= 0 && n_chunks > 0 && (n_chunks == 1 || part));
+    // Every query's key range must fit the cache ring.
+    const int longest = window > 0 ? (p0 + n_tok < window ? p0 + n_tok : window) : p0 + n_tok;
+    CHECK_DIMS(longest <= cap);
+    hipLaunchKernelGGL(k_attn_split, dim3(n_tok * n_head, n_chunks), dim3(ATT_TILE), 0, 0, q, (const uint8_t *)kc,
+                       (const uint8_t *)vc, out, part, n_head, n_kv, hd, p0, cap, window, n_chunks);
+    return launched();
+}
+
+int rvh_attn_combine(const float *part, float *out, int rows, int hd, int n_chunks) {
+    CHECK_DIMS(part && out && rows > 0 && hd > 0 && n_chunks > 1);
+    hipLaunchKernelGGL(k_attn_combine, dim3(rows), dim3(256), 0, 0, part, out, hd, n_chunks);
     return launched();
 }
 

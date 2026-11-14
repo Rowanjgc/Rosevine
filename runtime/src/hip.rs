@@ -81,6 +81,22 @@ mod ffi {
             window: c_int,
             max_keys: c_int,
         ) -> c_int;
+        pub fn rvh_attn_split(
+            q: *const f32,
+            kc: *const c_void,
+            vc: *const c_void,
+            out: *mut f32,
+            part: *mut f32,
+            n_tok: c_int,
+            n_head: c_int,
+            n_kv: c_int,
+            hd: c_int,
+            p0: c_int,
+            cap: c_int,
+            window: c_int,
+            n_chunks: c_int,
+        ) -> c_int;
+        pub fn rvh_attn_combine(part: *const f32, out: *mut f32, rows: c_int, hd: c_int, n_chunks: c_int) -> c_int;
         pub fn rvh_geglu(g: *const f32, u: *const f32, out: *mut f32, n: c_int) -> c_int;
         pub fn rvh_geglu_split(gu: *const f32, out: *mut f32, rows: c_int, ff: c_int) -> c_int;
         pub fn rvh_add(a: *const f32, b: *const f32, out: *mut f32, n: c_int) -> c_int;
@@ -445,6 +461,64 @@ pub fn attention(q: F, kc: B, vc: B, out: F, scores: F, s: AttnShape) -> Result<
             int(s.max_keys)?,
         )
     })
+}
+
+/// Blocks the split-K kernel aims for; with the per-query-head blocks it bounds the partial scratch.
+pub const ATTN_TARGET_BLOCKS: usize = 1024;
+/// Fewest keys worth a chunk of its own.
+pub const ATTN_MIN_CHUNK: usize = 64;
+
+/// Key chunks per query-head for [`attention_split`]: enough blocks to fill the device when there
+/// are few query-heads (decode), one chunk when the query-heads alone fill it (prefill).
+pub fn attention_chunks(n_tok: usize, n_head: usize, longest: usize) -> usize {
+    let by_keys = longest.div_ceil(ATTN_MIN_CHUNK).max(1);
+    let by_blocks = (ATTN_TARGET_BLOCKS / (n_tok * n_head).max(1)).max(1);
+    by_keys.min(by_blocks)
+}
+
+/// f32 elements of partial scratch that [`attention_split`] needs for at most `n_tok` tokens of
+/// `n_head` heads of up to `hd` values, whatever the context: `attention_chunks` keeps query-heads
+/// times chunks at or below `max(n_tok * n_head, ATTN_TARGET_BLOCKS)`.
+pub fn attention_split_scratch(n_tok: usize, n_head: usize, hd: usize) -> usize {
+    (n_tok * n_head).max(ATTN_TARGET_BLOCKS) * (hd + 2)
+}
+
+/// Split-K attention (K3): the same result as [`attention`] up to summation order, with keys spread
+/// over [`attention_chunks`] blocks per query-head and merged by a second kernel when there is more
+/// than one chunk. `part` holds [`attention_split_scratch`] floats; `s.max_keys` is not used.
+/// Returns the chunk count.
+pub fn attention_split(q: F, kc: B, vc: B, out: F, part: F, s: AttnShape) -> Result<usize, Error> {
+    let nq = s.n_tok * s.n_head * s.hd;
+    let c = s.cap * s.n_kv * Q8_ROW(s.hd);
+    let last = s.p0 + s.n_tok;
+    let longest = if s.window > 0 { last.min(s.window) } else { last };
+    let chunks = attention_chunks(s.n_tok, s.n_head, longest);
+    let rows = s.n_tok * s.n_head;
+    let (qp, kp, vp, op) = (q.p(nq)?, kc.p(c)?, vc.p(c)?, out.p(nq)?);
+    let pp = if chunks > 1 { part.p(rows * chunks * (s.hd + 2))? } else { ptr::null_mut() };
+    // SAFETY: all ranges checked; the C side checks each query's key count against cap.
+    launched(unsafe {
+        ffi::rvh_attn_split(
+            qp,
+            kp,
+            vp,
+            op,
+            pp,
+            int(s.n_tok)?,
+            int(s.n_head)?,
+            int(s.n_kv)?,
+            int(s.hd)?,
+            int(s.p0)?,
+            int(s.cap)?,
+            int(s.window)?,
+            int(chunks)?,
+        )
+    })?;
+    if chunks > 1 {
+        // SAFETY: the partial range was checked above and the output range with `out`.
+        launched(unsafe { ffi::rvh_attn_combine(pp, op, int(rows)?, int(s.hd)?, int(chunks)?) })?;
+    }
+    Ok(chunks)
 }
 
 pub fn geglu(g: F, u: F, out: F, n: usize) -> Result<(), Error> {

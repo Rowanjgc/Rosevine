@@ -377,7 +377,13 @@ mod hip_synthetic {
     pub const PATTERN_HIP: [bool; 4] = [true, false, true, true];
 
     pub fn hip_cfg(cpu_layers: usize) -> HipConfig {
-        HipConfig { exec: cfg(64, 16), cpu_expert_layers: cpu_layers, max_vram: 1 << 30, vram_reserve: 0 }
+        HipConfig {
+            exec: cfg(64, 16),
+            cpu_expert_layers: cpu_layers,
+            max_vram: 1 << 30,
+            vram_reserve: 0,
+            attention: Default::default(),
+        }
     }
 
     /// Prefill 12 tokens in one batch, then decode 20 single steps; every step's logits.
@@ -407,6 +413,36 @@ mod hip_synthetic {
         assert!(a.iter().all(|v| v.is_finite()));
         // Printed so a pre-change build's digest can be compared with a later one (R3a.1).
         println!("hip synthetic logits sha256 {}", digest(&a));
+    }
+
+    /// K3: the split-K kernel gives the reference kernel's logits up to summation order, both from
+    /// a fresh session and after switching kernels between evaluations; a split-only session has no
+    /// reference scratch and refuses to switch back.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn split_attention_matches_the_reference_kernel_end_to_end() {
+        use rosevine_runtime::hip_exec::Attention;
+        hip::init(0).unwrap();
+        let m = model(&PATTERN_HIP, 11);
+        let w = weights(&m);
+        let toks = tokens(32, 9);
+        let reference = run(&mut HipSession::new(&w, hip_cfg(2)).unwrap(), &toks);
+        let rel = |a: &[f32]| {
+            let num: f64 = a.iter().zip(&reference).map(|(x, y)| f64::from(x - y).powi(2)).sum();
+            let den: f64 = reference.iter().map(|y| f64::from(*y).powi(2)).sum();
+            (num / den).sqrt()
+        };
+        let mut split = HipSession::new(&w, HipConfig { attention: Attention::Split, ..hip_cfg(2) }).unwrap();
+        let a = run(&mut split, &toks);
+        assert!(rel(&a) < 1e-4, "split session rel {}", rel(&a));
+        assert!(split.set_attention(Attention::Reference).is_err());
+        let mut switched = HipSession::new(&w, hip_cfg(2)).unwrap();
+        switched.set_attention(Attention::Split).unwrap();
+        let b = run(&mut switched, &toks);
+        assert_eq!(digest(&a), digest(&b), "a switched session runs the same split kernel");
+        switched.reset();
+        switched.set_attention(Attention::Reference).unwrap();
+        assert_eq!(digest(&run(&mut switched, &toks)), digest(&reference));
     }
 
     /// Device calls of one single-token decode evaluation with `Logits::Last`, counted by hand
