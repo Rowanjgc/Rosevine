@@ -43,6 +43,34 @@ pub struct HipConfig {
     pub max_vram: usize,
     /// Device bytes that must remain free after allocation (for other processes).
     pub vram_reserve: usize,
+    /// Attention kernel. The reference kernel stays the default until K3's gate review.
+    pub attention: Attention,
+}
+
+/// Attention kernel choice (K3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Attention {
+    /// One block per query-head (R2), with `max_batch * n_head * max_ctx` floats of score scratch.
+    #[default]
+    Reference,
+    /// Split-K online softmax ([`hip::attention_split`]); scratch independent of `max_ctx`.
+    Split,
+}
+
+impl Attention {
+    pub fn parse(s: &str) -> Option<Attention> {
+        match s {
+            "ref" => Some(Attention::Reference),
+            "split" => Some(Attention::Split),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Attention::Reference => "ref",
+            Attention::Split => "split",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -129,6 +157,8 @@ pub struct HipSession<'w, 'a> {
     device_bytes: usize,
     probe: Option<Box<Probe>>,
     experts: Option<WorkerPool>,
+    /// Kernel in use; starts as `cfg.attention` (see [`HipSession::set_attention`]).
+    attention: Attention,
 }
 
 /// Instrumentation state: the span accumulator plus, in `Mode::Events`, one device event per span
@@ -244,12 +274,13 @@ impl<'w, 'a> HipSession<'w, 'a> {
             let cap = exec::layer_cap(l, &cfg.exec, win);
             total = total.checked_add(2 * cap * l.n_kv_heads * (l.head_dim / QK * Q8_BLOCK))?;
         }
-        let (fl, ints) = Self::scratch_sizes(w, &cfg.exec)?;
+        let (fl, ints) = Self::scratch_sizes(w, cfg)?;
         total.checked_add(fl.checked_mul(4)?)?.checked_add(ints.checked_mul(4)?)
     }
 
     /// (f32 elements, i32 elements) of device scratch.
-    fn scratch_sizes(w: &Weights, cfg: &ExecConfig) -> Option<(usize, usize)> {
+    fn scratch_sizes(w: &Weights, hc: &HipConfig) -> Option<(usize, usize)> {
+        let cfg = &hc.exec;
         let c = &w.cfg;
         let b = cfg.max_batch;
         let e = c.n_embd as usize;
@@ -260,8 +291,21 @@ impl<'w, 'a> HipSession<'w, 'a> {
         let u = c.n_experts_used as usize;
         let ne = c.n_experts as usize;
         let per_tok = 6 * e + 2 * qd + 2 * kvd + 3 * ff + ne + u * (2 * e + 3 * fe + 2) + w.n_vocab();
-        let scores = b.checked_mul(c.n_head as usize)?.checked_mul(cfg.max_ctx)?;
+        let scores = Self::attention_scratch(w, hc)?;
         Some((b.checked_mul(per_tok)?.checked_add(scores)?, b * (1 + 2 * u)))
+    }
+
+    /// f32 elements of attention scratch for the configured kernel. A session configured with the
+    /// reference kernel also fits the split kernel's scratch, so [`Self::set_attention`] can switch
+    /// it for paired comparisons; a split session never holds the `max_ctx`-sized buffer.
+    fn attention_scratch(w: &Weights, hc: &HipConfig) -> Option<usize> {
+        let nh = w.cfg.n_head as usize;
+        let hd = w.layers.iter().map(|l| l.head_dim).max()?;
+        let split = hip::attention_split_scratch(hc.exec.max_batch, nh, hd);
+        match hc.attention {
+            Attention::Reference => Some(hc.exec.max_batch.checked_mul(nh)?.checked_mul(hc.exec.max_ctx)?.max(split)),
+            Attention::Split => Some(split),
+        }
     }
 
     pub fn new(w: &'w Weights<'a>, cfg: HipConfig) -> Result<Self, Error> {
@@ -382,7 +426,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
             pos: fb(b * u)?,
             scale: fb(b * u)?,
             weight: fb(b * u)?,
-            scores: fb(b * c.n_head as usize * ec.max_ctx)?,
+            scores: fb(Self::attention_scratch(w, &cfg).ok_or(Error::Resource("size overflow"))?)?,
             logits: fb(b * vocab)?,
         };
         let hs = HostScratch {
@@ -412,6 +456,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
             device_bytes: need,
             probe: None,
             experts,
+            attention: cfg.attention,
             w,
             cfg,
         })
@@ -435,6 +480,20 @@ impl<'w, 'a> HipSession<'w, 'a> {
                 Some(Box::new(Probe { instr: Instr::new(mode, n_layers, max_bounds, now), events, began: now }));
         }
         Ok(())
+    }
+
+    /// Switch the attention kernel between evaluations. A session created with the split kernel has
+    /// no reference-kernel scratch and cannot switch back.
+    pub fn set_attention(&mut self, attention: Attention) -> Result<(), Error> {
+        if attention == Attention::Reference && self.cfg.attention == Attention::Split {
+            return Err(Error::Resource("split-kernel session has no reference attention scratch"));
+        }
+        self.attention = attention;
+        Ok(())
+    }
+
+    pub fn attention(&self) -> Attention {
+        self.attention
     }
 
     /// Measurements so far, when instrumentation is enabled.
@@ -641,7 +700,14 @@ impl<'w, 'a> HipSession<'w, 'a> {
             window: if l.local { c.sliding_window as usize } else { 0 },
             max_keys: self.cfg.exec.max_ctx,
         };
-        hip::attention(d.q.f(0), dl.k_cache.at(0), dl.v_cache.at(0), d.attn.f(0), d.scores.f(0), shape)?;
+        match self.attention {
+            Attention::Reference => {
+                hip::attention(d.q.f(0), dl.k_cache.at(0), dl.v_cache.at(0), d.attn.f(0), d.scores.f(0), shape)?
+            }
+            Attention::Split => {
+                hip::attention_split(d.q.f(0), dl.k_cache.at(0), dl.v_cache.at(0), d.attn.f(0), d.scores.f(0), shape)?;
+            }
+        }
         self.emit_dev(obs, "kqv_out", ilg, &d.attn, n * qd)?;
         mark(&mut self.probe, Span::AttnOut, il)?;
         hip::q4_mm(dl.wo.at(0), d.attn.f(0), d.o.f(0), e, qd, n)?;

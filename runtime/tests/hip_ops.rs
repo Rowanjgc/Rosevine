@@ -141,6 +141,110 @@ fn router_norm_rope_and_embedding_match_cpu() {
     assert_eq!(get(&dout, ids.len() * e), want);
 }
 
+/// Q8_0 K/V ring caches of `cap` slots for positions `0..total` (slot = position % cap), built on
+/// the host exactly as `kv_store` writes them.
+fn q8_caches(r: &mut Rng, total: usize, cap: usize, nkv: usize, hd: usize) -> (Vec<u8>, Vec<u8>) {
+    let row = hd / QK * Q8_BLOCK;
+    let (mut kc, mut vc) = (vec![0u8; cap * nkv * row], vec![0u8; cap * nkv * row]);
+    for p in 0..total {
+        for h in 0..nkv {
+            let o = ((p % cap) * nkv + h) * row;
+            ops::quantize_q8_0(&r.vec(hd, 1.0), &mut kc[o..o + row]);
+            ops::quantize_q8_0(&r.vec(hd, 1.0), &mut vc[o..o + row]);
+        }
+    }
+    (kc, vc)
+}
+
+/// CPU reference attention for queries at positions `p0..p0 + n` (scale 1.0, causal, window 0 =
+/// global), with the CPU executor's ops.
+#[allow(clippy::too_many_arguments)]
+fn cpu_attention(
+    q: &[f32],
+    kc: &[u8],
+    vc: &[u8],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    cap: usize,
+    win: usize,
+    p0: usize,
+    n: usize,
+) -> Vec<f32> {
+    let row = hd / QK * Q8_BLOCK;
+    let mut want = vec![0.0f32; n * nh * hd];
+    for t in 0..n {
+        let pos = p0 + t;
+        let lo = if win > 0 { (pos + 1).saturating_sub(win) } else { 0 };
+        for h in 0..nh {
+            let g = h / (nh / nkv);
+            let qh = &q[(t * nh + h) * hd..(t * nh + h + 1) * hd];
+            let at = |p: usize| ((p % cap) * nkv + g) * row;
+            let mut sc: Vec<f32> = (lo..=pos).map(|p| ops::dot_q8_0(&kc[at(p)..at(p) + row], qh)).collect();
+            ops::softmax(&mut sc);
+            let out = &mut want[(t * nh + h) * hd..(t * nh + h + 1) * hd];
+            for (p, &a) in (lo..=pos).zip(&sc) {
+                ops::axpy_q8_0(&vc[at(p)..at(p) + row], a, out);
+            }
+        }
+    }
+    want
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn split_attention_matches_cpu_and_the_reference_kernel() {
+    init();
+    let mut r = Rng(5);
+    // (name, heads, kv heads, head dim, window, ring capacity, filled positions, queries, expected chunks)
+    let cases = [
+        ("local ring wrap", 16, 8, 256, 1024, 1028, 1030, 4, 16),
+        ("global decode", 16, 2, 512, 0, 5000, 5000, 1, 64),
+        ("global batch of 8", 16, 2, 512, 0, 5000, 5000, 8, 8),
+        ("global prefill microbatch", 16, 2, 512, 0, 5000, 5000, 64, 1),
+        ("short context", 16, 2, 512, 0, 100, 3, 1, 1),
+        ("ragged chunks", 16, 2, 512, 0, 200, 129, 1, 3),
+    ];
+    for (name, nh, nkv, hd, win, cap, total, n, chunks) in cases {
+        let (kc, vc) = q8_caches(&mut r, total, cap, nkv, hd);
+        let q = r.vec(n * nh * hd, 0.2);
+        let p0 = total - n;
+        let want = cpu_attention(&q, &kc, &vc, nh, nkv, hd, cap, win, p0, n);
+        let (dq, dkc, dvc) = (dev(&q), dev(&kc), dev(&vc));
+        let dout = DevBuf::new(n * nh * hd * 4).unwrap();
+        let shape = AttnShape { n_tok: n, n_head: nh, n_kv: nkv, hd, p0, cap, window: win, max_keys: cap };
+        let dpart = DevBuf::new(hip::attention_split_scratch(n, nh, hd) * 4).unwrap();
+        let c = hip::attention_split(dq.f(0), dkc.at(0), dvc.at(0), dout.f(0), dpart.f(0), shape).unwrap();
+        assert_eq!(c, chunks, "{name}: chunk count");
+        let split = get(&dout, want.len());
+        let e = rel(&split, &want);
+        assert!(e < 1e-5, "{name}: split vs CPU rel {e}");
+        let dscores = DevBuf::new(n * nh * cap * 4).unwrap();
+        hip::attention(dq.f(0), dkc.at(0), dvc.at(0), dout.f(0), dscores.f(0), shape).unwrap();
+        let e = rel(&split, &get(&dout, want.len()));
+        assert!(e < 1e-5, "{name}: split vs reference kernel rel {e}");
+    }
+    // A key range beyond the ring is rejected rather than read, as for the reference kernel.
+    let (nh, nkv, hd, cap) = (16, 8, 256, 64);
+    let (dq, dkc, dvc) =
+        (dev(&vec![0.0f32; nh * hd]), DevBuf::new(cap * nkv * 272).unwrap(), DevBuf::new(cap * nkv * 272).unwrap());
+    let dout = DevBuf::new(nh * hd * 4).unwrap();
+    let dpart = DevBuf::new(hip::attention_split_scratch(1, nh, hd) * 4).unwrap();
+    let bad = AttnShape { n_tok: 1, n_head: nh, n_kv: nkv, hd, p0: cap, cap, window: 0, max_keys: cap };
+    assert!(hip::attention_split(dq.f(0), dkc.at(0), dvc.at(0), dout.f(0), dpart.f(0), bad).is_err());
+}
+
+#[test]
+fn split_attention_scratch_bounds_every_chunk_count() {
+    for n_tok in [1, 2, 3, 8, 31, 64, 256] {
+        for longest in [1, 63, 64, 65, 1000, 16_384, 262_144] {
+            let chunks = hip::attention_chunks(n_tok, 16, longest);
+            assert!(chunks >= 1 && chunks <= longest.div_ceil(hip::ATTN_MIN_CHUNK));
+            assert!(n_tok * 16 * chunks * 514 <= hip::attention_split_scratch(n_tok, 16, 512));
+        }
+    }
+}
+
 #[test]
 #[ignore = "needs a GPU"]
 fn kv_store_and_attention_match_cpu_across_the_ring() {

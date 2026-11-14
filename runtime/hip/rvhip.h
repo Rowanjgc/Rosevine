@@ -55,6 +55,13 @@ int rvh_kv_store(const float *k, const float *v, void *kc, void *vc, int n_tok, 
  * scores: n_tok * n_head * max_keys floats of scratch. */
 int rvh_attention(const float *q, const void *kc, const void *vc, float *out, float *scores, int n_tok, int n_head,
                   int n_kv, int hd, int p0, int cap, int window, int max_keys);
+/* Split-K attention (K3), same semantics as rvh_attention. Each query's keys are cut into n_chunks
+ * contiguous chunks. With n_chunks == 1 the output is written directly (part may be NULL); otherwise
+ * part receives n_tok * n_head * n_chunks * (hd + 2) floats for rvh_attn_combine. hd <= 512. */
+int rvh_attn_split(const float *q, const void *kc, const void *vc, float *out, float *part, int n_tok, int n_head,
+                   int n_kv, int hd, int p0, int cap, int window, int n_chunks);
+/* Merge rows * n_chunks partials from rvh_attn_split into rows outputs of hd. n_chunks > 1. */
+int rvh_attn_combine(const float *part, float *out, int rows, int hd, int n_chunks);
 /* out[i] = gelu(g[i]) * u[i] */
 int rvh_geglu(const float *g, const float *u, float *out, int n);
 /* Rows of 2*ff (gate then up) to rows of ff. */

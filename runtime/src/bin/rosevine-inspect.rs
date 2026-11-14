@@ -10,8 +10,10 @@
 //! rosevine-inspect generate <gguf> --n <steps> [--batch B] [--threads T] [--ctx C] [--instr host|sync|events]
 //!                                                     # stdin: prompt token ids
 //! rosevine-inspect replay   <gguf> --n-prompt P --n-decode D [--reps R] [--batch B] [--threads T] [--ctx C]
-//!                           [--instr MODE] [--instr-prefill MODE] [--instr-per-layer]
+//!                           [--instr MODE] [--instr-prefill MODE] [--instr-per-layer] [--attention ref|split]
 //!                                                     # stdin: P + D frozen token ids (parity P1)
+//! rosevine-inspect ab-attention <gguf> --n-prompt P --n-decode D --pairs K [--batch B] [--threads T]
+//!                                                     # stdin: P + D frozen token ids (K3, hip only)
 //! ```
 //!
 //! `kld`, `generate`, `replay` and `dump` take `--backend cpu|hip` (hip needs the `hip` feature) with
@@ -160,6 +162,8 @@ fn run(args: &[String]) -> Result<(), Error> {
         "kld" => kld(args, &g, &mut out)?,
         "generate" => generate(args, &g, &mut out)?,
         "replay" => replay(args, &g, &mut out)?,
+        #[cfg(feature = "hip")]
+        "ab-attention" => ab_attention(args, &g, &mut out)?,
         "dump" => dump(args, &g)?,
         _ => return Err(Error::UnsupportedInput("unknown command")),
     }
@@ -219,6 +223,11 @@ impl<'w, 'a> Exec<'w, 'a> {
                     cpu_expert_layers: opt(args, "--cpu-moe").unwrap_or(10),
                     max_vram: gib("--max-vram-gib", 10.0),
                     vram_reserve: gib("--vram-reserve-gib", 2.0),
+                    attention: match opt::<String>(args, "--attention") {
+                        Some(a) => rosevine_runtime::hip_exec::Attention::parse(&a)
+                            .ok_or(Error::UnsupportedInput("--attention must be ref or split"))?,
+                        None => Default::default(),
+                    },
                 };
                 let mut s = HipSession::new_with_experts(w, hc, kernel, wait)?;
                 s.set_expert_activation(activation)?;
@@ -561,10 +570,11 @@ fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> 
          \"backend\":\"{backend}\",\"n_prompt\":{n_prompt},\"n_decode\":{n_decode},\"reps\":{reps},\
          \"n_ctx\":{ctx},\"n_batch\":{batch},\"n_ubatch\":{batch},\"threads\":{threads},\
          \"cpu_moe_layers\":{cpu_moe},\"kv_type\":\"q8_0\",\"cpu_expert_activation\":\"{}\",\
-         \"expert_kernel\":\"{}\",\"expert_wait\":\"{}\",\"tokens_fnv1a64\":\"{:016x}\"}}",
+         \"expert_kernel\":\"{}\",\"expert_wait\":\"{}\",\"attention\":\"{}\",\"tokens_fnv1a64\":\"{:016x}\"}}",
         sess.expert_activation().name(),
         opt::<String>(args, "--expert-kernel").unwrap_or_else(|| "auto".into()),
         opt::<String>(args, "--expert-wait").unwrap_or_else(|| "sleep".into()),
+        opt::<String>(args, "--attention").unwrap_or_else(|| "ref".into()),
         fnv1a64(&toks)
     )
     .ok();
@@ -611,6 +621,89 @@ fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> 
         )
         .ok();
         out.flush().ok();
+    }
+    Ok(())
+}
+
+/// K3 paired kernel comparison (HIP only): prefill the first `P` frozen ids once with the reference
+/// attention kernel, then for each of `K` pairs rewind to `P` and feed the next `D` ids one at a time
+/// with each kernel, in ABBA order (reference first on even pairs). Both kernels decode from the same
+/// KV state and thermal context. Prints one JSON config line, then one line per block with
+/// per-step nanoseconds and top-1 ids.
+#[cfg(feature = "hip")]
+fn ab_attention(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> {
+    use rosevine_runtime::hip_exec::Attention;
+    let n_prompt: usize = opt(args, "--n-prompt").ok_or(Error::UnsupportedInput("--n-prompt required"))?;
+    let n_decode: usize = opt(args, "--n-decode").ok_or(Error::UnsupportedInput("--n-decode required"))?;
+    let pairs: usize = opt(args, "--pairs").ok_or(Error::UnsupportedInput("--pairs required"))?;
+    if n_prompt == 0 || n_decode == 0 || !(1..=1000).contains(&pairs) {
+        return Err(Error::UnsupportedInput("--n-prompt and --n-decode must be positive and --pairs 1..=1000"));
+    }
+    if opt::<String>(args, "--backend").as_deref() != Some("hip") || args.iter().any(|a| a == "--attention") {
+        return Err(Error::UnsupportedInput("ab-attention needs --backend hip and sets the kernel itself"));
+    }
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let mut toks = Vec::new();
+    for t in line.split_whitespace() {
+        toks.push(t.parse::<u32>().map_err(|_| Error::UnsupportedInput("malformed token id"))?);
+    }
+    if toks.len() < n_prompt + n_decode {
+        return Err(Error::UnsupportedInput("token input shorter than prompt plus decode"));
+    }
+    toks.truncate(n_prompt + n_decode);
+    let w = Weights::bind(g)?;
+    let cfg = exec_config(args, n_prompt + n_decode, 64);
+    if n_decode > cfg.max_batch + 1 {
+        return Err(Error::UnsupportedInput("--n-decode exceeds the rewindable span (batch + 1)"));
+    }
+    let batch = cfg.max_batch;
+    let Exec::Hip(mut sess) = Exec::new(args, &w, cfg)? else {
+        return Err(Error::UnsupportedInput("ab-attention needs --backend hip"));
+    };
+    writeln!(
+        out,
+        "{{\"schema\":\"rosevine-ab-attention-v1\",\"kind\":\"config\",\"n_prompt\":{n_prompt},\
+         \"n_decode\":{n_decode},\"pairs\":{pairs},\"n_batch\":{batch},\"cpu_expert_activation\":\"{}\",\
+         \"tokens_fnv1a64\":\"{:016x}\"}}",
+        sess.expert_activation().name(),
+        fnv1a64(&toks)
+    )
+    .ok();
+    let never = || false;
+    let t0 = Instant::now();
+    for ch in toks[..n_prompt].chunks(batch) {
+        sess.eval(ch, Logits::None, &never, None)?;
+    }
+    writeln!(out, "{{\"kind\":\"prefill\",\"attention\":\"ref\",\"prefill_ns\":{}}}", t0.elapsed().as_nanos()).ok();
+    for pair in 0..pairs {
+        let order = if pair % 2 == 0 {
+            [Attention::Reference, Attention::Split]
+        } else {
+            [Attention::Split, Attention::Reference]
+        };
+        for kernel in order {
+            sess.set_attention(kernel)?;
+            sess.rewind(n_prompt)?;
+            let mut steps = Vec::with_capacity(n_decode);
+            let mut top1 = Vec::with_capacity(n_decode);
+            for &t in &toks[n_prompt..] {
+                let s = Instant::now();
+                let lg = sess.eval(&[t], Logits::Last, &never, None)?;
+                std::hint::black_box(lg.first());
+                steps.push(s.elapsed().as_nanos().to_string());
+                top1.push(argmax(lg).to_string());
+            }
+            writeln!(
+                out,
+                "{{\"kind\":\"block\",\"pair\":{pair},\"attention\":\"{}\",\"decode_ns\":[{}],\"top1\":[{}]}}",
+                kernel.name(),
+                steps.join(","),
+                top1.join(",")
+            )
+            .ok();
+            out.flush().ok();
+        }
     }
     Ok(())
 }
