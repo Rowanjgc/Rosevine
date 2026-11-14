@@ -80,6 +80,89 @@ fn q4_matmul_matches_cpu_at_target_shapes() {
     }
 }
 
+/// Exact f64 Q4_0 matmul over a subset of output rows: `[token][row index]`.
+fn f64_q4_rows(w: &[u8], k: usize, x: &[f32], n_in: usize, rows: &[usize]) -> Vec<f64> {
+    let rb = k / QK * Q4_BLOCK;
+    let mut deq = vec![0.0f32; k];
+    let mut out = vec![0.0; n_in * rows.len()];
+    for (j, &r) in rows.iter().enumerate() {
+        ops::dequant_q4_0(&w[r * rb..(r + 1) * rb], &mut deq);
+        for t in 0..n_in {
+            out[t * rows.len() + j] = deq.iter().zip(&x[t * k..(t + 1) * k]).map(|(a, b)| *a as f64 * *b as f64).sum();
+        }
+    }
+    out
+}
+
+fn rel64(a: &[f32], b: &[f64]) -> f64 {
+    let num: f64 = a.iter().zip(b).map(|(x, y)| (*x as f64 - y).powi(2)).sum();
+    let den: f64 = b.iter().map(|y| y.powi(2)).sum();
+    (num / den.max(1e-300)).sqrt()
+}
+
+/// K2 criterion 1: `q4_mv` against the CPU ops (rel < 1e-5) and against exact f64, where it must be
+/// no worse than twice `q4_mm`'s error, at every model shape and 1, 3, 8 and 64 tokens.
+#[test]
+#[ignore = "needs a GPU"]
+fn q4_vec_kernel_matches_cpu_and_f64_at_model_shapes() {
+    init();
+    let mut r = Rng(7);
+    // (name, n_out, k): Q/K/V local and global, O local and global, shared MLP, expert, head.
+    let shapes = [
+        ("q-local", 4096, 2816),
+        ("kv-local", 2048, 2816),
+        ("q-global", 8192, 2816),
+        ("k-global", 1024, 2816),
+        ("o-local", 2816, 4096),
+        ("o-global", 2816, 8192),
+        ("ffn-gate-up", 2112, 2816),
+        ("ffn-down", 2816, 2112),
+        ("expert-gate-up", 1408, 2816),
+        ("expert-down", 2816, 704),
+        ("head", 262_144, 2816),
+    ];
+    for (name, n_out, k) in shapes {
+        let w = r.q4(n_out, k);
+        let (dw, threads) = (dev(&w), std::thread::available_parallelism().map_or(4, |n| n.get()));
+        let step = (n_out / 512).max(1);
+        let rows: Vec<usize> = (0..n_out).step_by(step).collect();
+        for n_in in [1, 3, 8, 64] {
+            let x = r.vec(n_in * k, 1.0);
+            let mut want = vec![0.0; n_in * n_out];
+            ops::matmul_q4_0(&w, k, &x, n_in, &mut want, n_out, threads);
+            let dx = dev(&x);
+            let (dv, dr) = (DevBuf::new(n_in * n_out * 4).unwrap(), DevBuf::new(n_in * n_out * 4).unwrap());
+            hip::q4_mv(dw.at(0), dx.f(0), dv.f(0), n_out, k, n_in).unwrap();
+            hip::q4_mm(dw.at(0), dx.f(0), dr.f(0), n_out, k, n_in).unwrap();
+            let (vec_out, ref_out) = (get(&dv, n_in * n_out), get(&dr, n_in * n_out));
+            let e = rel(&vec_out, &want);
+            assert!(e < 1e-5, "q4_mv {name} n_in={n_in}: rel vs cpu {e}");
+            let exact = f64_q4_rows(&w, k, &x, n_in, &rows);
+            let pick = |v: &[f32]| -> Vec<f32> {
+                (0..n_in).flat_map(|t| rows.iter().map(move |&j| v[t * n_out + j])).collect()
+            };
+            let (ev, er) = (rel64(&pick(&vec_out), &exact), rel64(&pick(&ref_out), &exact));
+            println!("q4 f64 {name} n_in={n_in}: vec {ev:.3e} ref {er:.3e}");
+            assert!(ev <= 2.0 * er.max(1e-9), "q4_mv {name} n_in={n_in}: f64 err {ev} vs q4_mm {er}");
+            // Batch invariance, as for q4_mm.
+            if n_in > 1 {
+                let d1 = DevBuf::new(n_out * 4).unwrap();
+                hip::q4_mv(dw.at(0), dx.f((n_in - 1) * k), d1.f(0), n_out, k, 1).unwrap();
+                assert_eq!(get(&d1, n_out), vec_out[(n_in - 1) * n_out..], "{name} batch invariance");
+            }
+        }
+    }
+    // Unaligned activations fall back to q4_mm and still give its exact result.
+    let (n_out, k) = (2816, 704);
+    let w = r.q4(n_out, k);
+    let x = r.vec(k + 1, 1.0);
+    let (dw, dx) = (dev(&w), dev(&x));
+    let (a, b) = (DevBuf::new(n_out * 4).unwrap(), DevBuf::new(n_out * 4).unwrap());
+    hip::q4_mv(dw.at(0), dx.f(1), a.f(0), n_out, k, 1).unwrap();
+    hip::q4_mm(dw.at(0), dx.f(1), b.f(0), n_out, k, 1).unwrap();
+    assert_eq!(get(&a, n_out), get(&b, n_out));
+}
+
 #[test]
 #[ignore = "needs a GPU"]
 fn router_norm_rope_and_embedding_match_cpu() {

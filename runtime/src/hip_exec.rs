@@ -43,9 +43,45 @@ pub struct HipConfig {
     pub max_vram: usize,
     /// Device bytes that must remain free after allocation (for other processes).
     pub vram_reserve: usize,
+    /// Q4_0 matmul kernel for the per-layer projections, experts and head (K2).
+    pub q4: Q4Kernel,
     /// Attention kernel. Split-K is the default since the maintainer adopted it after K3
     /// (docs/split-k-attention.md); the R2 reference kernel stays selectable.
     pub attention: Attention,
+}
+
+/// Q4_0 matmul kernel choice (K2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Q4Kernel {
+    /// `k_q4_mm` (R2): one warp per row, one block per lane per step.
+    #[default]
+    Reference,
+    /// `k_q4_mv`: quarter-block lanes with vector loads ([`hip::q4_mv`]).
+    Vec,
+}
+
+impl Q4Kernel {
+    pub fn parse(s: &str) -> Option<Q4Kernel> {
+        match s {
+            "ref" => Some(Q4Kernel::Reference),
+            "vec" => Some(Q4Kernel::Vec),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Q4Kernel::Reference => "ref",
+            Q4Kernel::Vec => "vec",
+        }
+    }
+}
+
+/// One Q4_0 matmul with the selected kernel.
+fn mm(kernel: Q4Kernel, w: hip::B, x: hip::F, y: hip::F, n_out: usize, k: usize, n_in: usize) -> Result<(), Error> {
+    match kernel {
+        Q4Kernel::Reference => hip::q4_mm(w, x, y, n_out, k, n_in),
+        Q4Kernel::Vec => hip::q4_mv(w, x, y, n_out, k, n_in),
+    }
 }
 
 /// Attention kernel choice (K3).
@@ -160,6 +196,8 @@ pub struct HipSession<'w, 'a> {
     experts: Option<WorkerPool>,
     /// Kernel in use; starts as `cfg.attention` (see [`HipSession::set_attention`]).
     attention: Attention,
+    /// Q4_0 matmul kernel in use; starts as `cfg.q4` (see [`HipSession::set_q4_kernel`]).
+    q4: Q4Kernel,
 }
 
 /// Instrumentation state: the span accumulator plus, in `Mode::Events`, one device event per span
@@ -458,6 +496,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
             probe: None,
             experts,
             attention: cfg.attention,
+            q4: cfg.q4,
             w,
             cfg,
         })
@@ -495,6 +534,15 @@ impl<'w, 'a> HipSession<'w, 'a> {
 
     pub fn attention(&self) -> Attention {
         self.attention
+    }
+
+    /// Switch the Q4_0 matmul kernel between evaluations (no scratch depends on it).
+    pub fn set_q4_kernel(&mut self, kernel: Q4Kernel) {
+        self.q4 = kernel;
+    }
+
+    pub fn q4_kernel(&self) -> Q4Kernel {
+        self.q4
     }
 
     /// Measurements so far, when instrumentation is enabled.
@@ -614,6 +662,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
             Logits::All => 0..n,
         };
         let n_out = rows.len();
+        let q4k = self.q4;
         mark(&mut self.probe, Span::Head, n_layers)?;
         if n_out > 0 {
             let c = &self.w.cfg;
@@ -621,7 +670,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
             hip::rms_norm(d.x.f(rows.start * e), d.cur.f(0), Some(self.output_norm.f(0)), n_out, e, c.rms_eps, 1.0)?;
             self.emit_dev(&mut obs, "result_norm", -1, &self.d.cur, n_out * e)?;
             let d = &self.d;
-            hip::q4_mm(self.tok_embd.at(0), d.cur.f(0), d.logits.f(0), vocab, e, n_out)?;
+            mm(q4k, self.tok_embd.at(0), d.cur.f(0), d.logits.f(0), vocab, e, n_out)?;
             if c.final_logit_softcap != 0.0 {
                 hip::softcap(d.logits.f(0), n_out * vocab, c.final_logit_softcap)?;
             }
@@ -670,15 +719,16 @@ impl<'w, 'a> HipSession<'w, 'a> {
         let qd = nh * hd;
         let kvd = nkv * hd;
         let p0 = self.n_past;
+        let q4k = self.q4;
 
         // Attention.
         mark(&mut self.probe, Span::Attn, il)?;
         hip::rms_norm(d.x.f(0), d.cur.f(0), Some(dl.attn_norm.f(0)), n, e, eps, 1.0)?;
         self.emit_dev(obs, "attn_norm", ilg, &d.cur, n * e)?;
-        hip::q4_mm(dl.wq.at(0), d.cur.f(0), d.q.f(0), qd, e, n)?;
-        hip::q4_mm(dl.wk.at(0), d.cur.f(0), d.k.f(0), kvd, e, n)?;
+        mm(q4k, dl.wq.at(0), d.cur.f(0), d.q.f(0), qd, e, n)?;
+        mm(q4k, dl.wk.at(0), d.cur.f(0), d.k.f(0), kvd, e, n)?;
         match &dl.wv {
-            Some(wv) => hip::q4_mm(wv.at(0), d.cur.f(0), d.v.f(0), kvd, e, n)?,
+            Some(wv) => mm(q4k, wv.at(0), d.cur.f(0), d.v.f(0), kvd, e, n)?,
             None => hip::copy(d.v.f(0), d.k.f(0), n * kvd)?,
         }
         let (base, ff) =
@@ -711,7 +761,7 @@ impl<'w, 'a> HipSession<'w, 'a> {
         }
         self.emit_dev(obs, "kqv_out", ilg, &d.attn, n * qd)?;
         mark(&mut self.probe, Span::AttnOut, il)?;
-        hip::q4_mm(dl.wo.at(0), d.attn.f(0), d.o.f(0), e, qd, n)?;
+        mm(q4k, dl.wo.at(0), d.attn.f(0), d.o.f(0), e, qd, n)?;
         hip::rms_norm(d.o.f(0), d.o.f(0), Some(dl.post_attn_norm.f(0)), n, e, eps, 1.0)?;
         hip::add(d.o.f(0), d.x.f(0), d.o.f(0), n * e)?;
         self.emit_dev(obs, "attn_out", ilg, &d.o, n * e)?;
@@ -720,10 +770,10 @@ impl<'w, 'a> HipSession<'w, 'a> {
         let ffd = c.ff_dense as usize;
         mark(&mut self.probe, Span::Mlp, il)?;
         hip::rms_norm(d.o.f(0), d.cur.f(0), Some(dl.ffn_norm.f(0)), n, e, eps, 1.0)?;
-        hip::q4_mm(dl.ffn_gate.at(0), d.cur.f(0), d.gate.f(0), ffd, e, n)?;
-        hip::q4_mm(dl.ffn_up.at(0), d.cur.f(0), d.up.f(0), ffd, e, n)?;
+        mm(q4k, dl.ffn_gate.at(0), d.cur.f(0), d.gate.f(0), ffd, e, n)?;
+        mm(q4k, dl.ffn_up.at(0), d.cur.f(0), d.up.f(0), ffd, e, n)?;
         hip::geglu(d.gate.f(0), d.up.f(0), d.mlp.f(0), n * ffd)?;
-        hip::q4_mm(dl.ffn_down.at(0), d.mlp.f(0), d.cur.f(0), e, ffd, n)?;
+        mm(q4k, dl.ffn_down.at(0), d.mlp.f(0), d.cur.f(0), e, ffd, n)?;
         hip::rms_norm(d.cur.f(0), d.cur.f(0), Some(dl.post_ffw_norm_1.f(0)), n, e, eps, 1.0)?;
         self.emit_dev(obs, "ffn_mlp", ilg, &d.cur, n * e)?;
 
@@ -783,11 +833,11 @@ impl<'w, 'a> HipSession<'w, 'a> {
                 let gu_bytes = gu_rows * (e / QK * Q4_BLOCK);
                 let dn_bytes = e * (fe / QK * Q4_BLOCK);
                 for &(ex, st, len) in &plan.groups {
-                    hip::q4_mm(gu_w.at(ex * gu_bytes), d.mx.f(st * e), d.gu.f(st * gu_rows), gu_rows, e, len)?;
+                    mm(q4k, gu_w.at(ex * gu_bytes), d.mx.f(st * e), d.gu.f(st * gu_rows), gu_rows, e, len)?;
                 }
                 hip::geglu_split(d.gu.f(0), d.h.f(0), pairs, fe)?;
                 for &(ex, st, len) in &plan.groups {
-                    hip::q4_mm(dn_w.at(ex * dn_bytes), d.h.f(st * fe), d.y.f(st * e), e, fe, len)?;
+                    mm(q4k, dn_w.at(ex * dn_bytes), d.h.f(st * fe), d.y.f(st * e), e, fe, len)?;
                 }
                 hip::moe_combine(d.y.f(0), pairs, d.pos.i(0), d.scale.f(0), d.weight.f(0), d.moe.f(0), n, used, e)?;
             }

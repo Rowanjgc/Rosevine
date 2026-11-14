@@ -43,6 +43,9 @@ int rvh_get_rows_q4(const void *w, const int32_t *ids, float *out, int n, int k,
 int rvh_rms_norm(const float *x, float *out, const float *weight, int rows, int width, float eps, float post);
 /* y[t][r] = W[r] . x[t]; W is Q4_0 n_out x k; x is n_in x k. */
 int rvh_q4_mm(const void *w, const float *x, float *y, int n_out, int k, int n_in);
+/* Same result as rvh_q4_mm up to summation order (K2): quarter-block lanes with vector loads.
+ * x must be 16-byte aligned and w 2-byte aligned. */
+int rvh_q4_mv(const void *w, const float *x, float *y, int n_out, int k, int n_in);
 /* Same for an f32 matrix (the router). */
 int rvh_f32_mm(const float *w, const float *x, float *y, int n_out, int k, int n_in);
 /* Per head of hd values over n_tok * n_heads heads: RMS norm (weight may be NULL), then NEOX
