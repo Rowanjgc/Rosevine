@@ -3,8 +3,11 @@
 Date: 2026-11-13. Bead: rv-e05-7n3.3 (K3), activated by the maintainer on
 2026-11-13 after K1 ([prefill and decode attribution](prefill-attribution.md)).
 Scope: parity-plan record [G1](parity-plan.md#g1-decode-attention-at-depth-existing-k3-rv-e05-7n33).
-Status: **criteria recorded before any K3 measurement**. Results follow in the
-sections below once measured. Raw captures, commands and hashes stay private.
+Status: **measured; performance criteria met, two pre-recorded correctness
+criteria not met** (2b and 3). A diagnostic finds no defect. The kernel stays
+opt-in, and adopting it is a maintainer decision. The criteria section is
+unchanged from its pre-measurement commit (`692b7df`). Raw captures, commands
+and hashes stay private.
 
 ## Change
 
@@ -56,3 +59,60 @@ Performance (parity-plan G1 thresholds, set before this work):
 
 A kernel that fails 4 is recorded as NO-GO for K3 and stays opt-in or is removed;
 the reference kernel remains correct and available either way.
+
+## Results
+
+Design as in criterion 5. Rosevine commit `47de6f4`; HIP, first-N = 10, Q8_0 CPU
+experts, 12 threads, batch 64, P3 parity fixture. 18 supervised single-shot
+processes over 2 sessions, all successful, under the run lock and the COMPUTE window.
+
+| # | Criterion | Result | Verdict |
+| --- | --- | --- | --- |
+| 1 | Op conformance below 1e-5 | All six cases pass against the CPU ops and `k_attention`; out-of-ring ranges rejected | Met |
+| 2a | KL inside the band | CPU reference: 0.0764, top-1 92.44%. Vulkan-fast: 0.0733, top-1 92.89%. | Met |
+| 2b | Mean KL moves by at most 0.002 | +0.0055 against both references (reference kernel: 0.0709 and 0.0679). PPL 12.23 → 12.28. | **Not met** |
+| 3 | Decode top-1 agreement at least 0.95 | d512: 1.000. d16384: 0.9375 (480 of 512 steps). | **Not met at d16384** |
+| 4 | `attn_core` at d16384 at most 15 ms; step gain at least 30 ms | `attn_core` 7.8 ms (global layers 5.7), from 54.7 ms. Step 78.7 → 31.7 ms, a gain of 47.0 ms. | Met |
+| 5 | Paired 95% interval excludes zero | d16384: gain 47.0 ms (46.7–47.1), ratio 0.403. d512: gain 4.4 ms (4.35–4.43), ratio 0.854. 16 ABBA pairs each. | Met |
+| 6 | Other regressions at most 2% | d512 decode is faster. Prefill at P = 2048: split/ref 0.992 and 0.990 in the two sessions (about 100 tok/s). Two sessions are too few for an interval, so only point estimates exist. | Met on point estimates |
+| 7 | Resources | Attention scratch at batch 64 is 2.1 MB, independent of context; the reference kernel needs 4 MiB per 1,024 tokens of `max_ctx` (64 MiB at 16k). Thermal flags and core-equivalents are in the private telemetry and were not analysed here. | Partly reported |
+
+Each kernel is bitwise self-consistent across its 8 blocks per session, so the
+disagreements are between the kernels, not run-to-run noise.
+
+### Diagnostic: defect or summation order?
+
+`attention_kernels_against_f64_in_the_peaked_regime` compares both kernels with
+exact f64 attention over the same Q8_0 caches. The setup is global layer shape
+(16 heads, 2 KV heads, D = 512) at depth 16,384, with query scales from
+near-uniform (0.05) to sharply peaked (2.0) score distributions.
+
+| Query scale | Reference kernel rel. error | Split kernel rel. error |
+| --- | --- | --- |
+| 0.05 | 2.3e-6 | 3.6e-7 |
+| 0.2 | 2.4e-6 | 4.2e-7 |
+| 0.5 | 1.9e-6 | 6.3e-7 |
+| 1.0 | 1.1e-6 | 6.5e-7 |
+| 2.0 | 1.2e-6 | 7.3e-7 |
+
+The split kernel is 1.6–6.5× **closer** to exact attention than the reference
+kernel. A likely reason, from the code rather than measured: its tiled partial sums replace the
+reference kernel's single serial value accumulation over all keys. The KL shift and the d16384 top-1 flips are
+therefore differences between two f32 approximations. The split kernel is the
+more accurate one. For scale, engine-to-engine top-1 agreement at the same depths
+in P3 was 0.92–0.99, including pinned llama.cpp HIP against Vulkan.
+
+This explains the failures; it does not convert them into passes. Criteria 2b and 3
+were set before measurement and are reported as not met.
+
+## Outcome
+
+- **Performance:** GO evidence. Decode at depth 16,384 is 2.5× faster per step.
+  Decode at 512 is 15% faster. `attn_core` is well under the 15 ms threshold.
+- **Correctness:**
+  - Inside the project's KL band against both frozen references.
+  - Outside the tighter kernel-to-kernel criteria recorded for K3.
+  - No defect found; the new kernel is closer to exact.
+- The kernel stays **opt-in** (`--attention split`). Making it the default, and
+  whether criteria 2b and 3 should be judged against exact attention rather than
+  the old kernel, are decisions for the maintainer at Gate 4.

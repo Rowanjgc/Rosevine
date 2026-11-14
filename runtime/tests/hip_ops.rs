@@ -358,3 +358,80 @@ fn expert_path_matches_cpu() {
     // Out-of-allocation ranges are refused before any launch.
     assert!(hip::q4_mm(dgu.at(0), dh.f(0), dout.f(0), 1 << 20, e, 1).is_err());
 }
+
+/// Exact (f64) attention over dequantized Q8_0 caches, for error budgets of the f32 kernels.
+#[allow(clippy::too_many_arguments)]
+fn f64_attention(
+    q: &[f32],
+    kc: &[u8],
+    vc: &[u8],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    cap: usize,
+    win: usize,
+    p0: usize,
+    n: usize,
+) -> Vec<f64> {
+    let row = hd / QK * Q8_BLOCK;
+    let deq = |c: &[u8], at: usize, d: usize| {
+        let blk = &c[at + d / QK * Q8_BLOCK..];
+        f64::from(ops::f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]))) * f64::from(blk[2 + d % QK] as i8)
+    };
+    let mut want = vec![0.0f64; n * nh * hd];
+    for t in 0..n {
+        let pos = p0 + t;
+        let lo = if win > 0 { (pos + 1).saturating_sub(win) } else { 0 };
+        for h in 0..nh {
+            let g = h / (nh / nkv);
+            let qh = &q[(t * nh + h) * hd..(t * nh + h + 1) * hd];
+            let at = |p: usize| ((p % cap) * nkv + g) * row;
+            let sc: Vec<f64> =
+                (lo..=pos).map(|p| (0..hd).map(|d| deq(kc, at(p), d) * f64::from(qh[d])).sum()).collect();
+            let mx = sc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let e: Vec<f64> = sc.iter().map(|s| (s - mx).exp()).collect();
+            let z: f64 = e.iter().sum();
+            let out = &mut want[(t * nh + h) * hd..(t * nh + h + 1) * hd];
+            for (p, &a) in (lo..=pos).zip(&e) {
+                for (d, o) in out.iter_mut().enumerate() {
+                    *o += a / z * deq(vc, at(p), d);
+                }
+            }
+        }
+    }
+    want
+}
+
+/// K3 diagnostic: error of both kernels against exact f64 attention, from near-uniform to sharply
+/// peaked score distributions at depth. Prints the errors; asserts only that the split kernel is no
+/// worse than twice the reference kernel's error, which separates a defect from summation order.
+#[test]
+#[ignore = "needs a GPU"]
+fn attention_kernels_against_f64_in_the_peaked_regime() {
+    init();
+    let mut r = Rng(17);
+    let (nh, nkv, hd, cap, total, n) = (16, 2, 512, 16_384, 16_384, 1);
+    let (kc, vc) = q8_caches(&mut r, total, cap, nkv, hd);
+    let (dkc, dvc) = (dev(&kc), dev(&vc));
+    for q_scale in [0.05f32, 0.2, 0.5, 1.0, 2.0] {
+        let q = r.vec(n * nh * hd, q_scale);
+        let p0 = total - n;
+        let exact = f64_attention(&q, &kc, &vc, nh, nkv, hd, cap, 0, p0, n);
+        let dq = dev(&q);
+        let dout = DevBuf::new(n * nh * hd * 4).unwrap();
+        let shape = AttnShape { n_tok: n, n_head: nh, n_kv: nkv, hd, p0, cap, window: 0, max_keys: cap };
+        let err = |got: &[f32]| {
+            let num: f64 = got.iter().zip(&exact).map(|(g, e)| (f64::from(*g) - e).powi(2)).sum();
+            let den: f64 = exact.iter().map(|e| e * e).sum();
+            (num / den).sqrt()
+        };
+        let dscores = DevBuf::new(n * nh * cap * 4).unwrap();
+        hip::attention(dq.f(0), dkc.at(0), dvc.at(0), dout.f(0), dscores.f(0), shape).unwrap();
+        let e_ref = err(&get(&dout, exact.len()));
+        let dpart = DevBuf::new(hip::attention_split_scratch(n, nh, hd) * 4).unwrap();
+        hip::attention_split(dq.f(0), dkc.at(0), dvc.at(0), dout.f(0), dpart.f(0), shape).unwrap();
+        let e_split = err(&get(&dout, exact.len()));
+        println!("q_scale={q_scale} rel_err_vs_f64 reference={e_ref:.3e} split={e_split:.3e}");
+        assert!(e_split <= 2.0 * e_ref.max(1e-7), "split error {e_split} exceeds twice the reference's {e_ref}");
+    }
+}
