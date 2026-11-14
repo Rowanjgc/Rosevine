@@ -172,7 +172,11 @@ result is labelled *internal* and does not count as Gate 4 evidence.
 **Gate 4 claim.** Unchanged:
 - at least 5% median benefit in a named primary metric, with a paired 95%
   interval above zero;
-- the comparison is against `vk-ref` or the defined unchanged control;
+- the comparison is against `vk-ref` or the defined unchanged control. The
+  control is the matching external configuration, never Rosevine's own
+  earlier kernels; a capability with no `vk-ref` equivalent needs its control
+  defined in a committed document before measurement (maintainer decision,
+  2026-11-14; see [Gate 4](gate-4-review.md#when-to-revisit-gate-4));
 - reproduced in a second session;
 - every regression reported.
 

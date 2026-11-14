@@ -2,7 +2,7 @@
 
 Date: 2026-11-13
 Bead: rv-e05-7n3.4
-Status: Reviewed
+Status: Reviewed; outcome confirmed by the maintainer on 2026-11-14
 Outcome: **NO-GO** for a Gate 4 optimized-path claim. One internal improvement
 (K3 split-K attention) is retained as the runtime default. The correct reference
 kernels stay available.
@@ -75,12 +75,39 @@ candidate can pass C2 against `vk-ref` today, and none was measured that way.
 - The final frontier study (rv-e08-nhh.3) can proceed with the unoptimized
   fallback. It must state that no Gate-4-validated optimized path exists.
 
-## Interpretation note
+## Maintainer decision (2026-11-14)
 
-C2 allows "the defined unchanged control", but the same document states that a
-paired interval against `r2-ref` does not count. This review reads the unchanged
-control as the matching external configuration, not Rosevine's own earlier
-kernels. If the maintainer intends K3's paired result against its reference
-kernel to count, K3 would meet C1–C3, and C4 would rest on the accepted 2b/3
-deviation. That would be a **GO, scoped** to depth-dependent decode attention.
-The evidence is in place for either reading; the decision is the maintainer's.
+**NO-GO confirmed.** C2 is read strictly: "the defined unchanged control" is
+the matching external configuration (`vk-ref`), never Rosevine's own earlier
+kernels. K3's paired result against the R2 kernel stays an internal ablation.
+[Optimization validation](optimization-validation.md#acceptance-and-gates)
+now states this.
+
+## When to revisit Gate 4
+
+Gate 4 reopens only when **all** of the following hold. Internal ablations
+alone never reopen it.
+
+| # | Condition |
+| --- | --- |
+| R1 | **Eligible candidate.** A path has passed its own criteria, recorded before measurement (K-style): op conformance, KL band against both frozen references, and its performance threshold. |
+| R2 | **Named workload and metric, recorded first.** The cell (for example decode at depth 16,384, prefill at P = 2,048, or MTP decode at depth 29,000) and its primary metric are committed before the comparison runs. |
+| R3 | **Plausible margin.** Rosevine's current uninstrumented rate for that cell is at least 0.95 × `vk-ref`, in the latest paired parity record or an unpaired check with a matched configuration. Below that, a 5% win against `vk-ref` cannot follow from one specialization, so no Gate 4 comparison is scheduled. |
+| R4 | **Paired external comparison.** Paired against `vk-ref` with matched timing boundaries under the [parity amendment](performance-parity.md) and the same placement and KV type. At least 5% median benefit, with a 95% bootstrap interval above zero, reproduced in a second session. Every regression in the other parity cells is reported. |
+| R5 | **No unacceptable quality change.** Teacher-forced KL inside the band against both references; no fidelity claim from a lower KL inside the band. |
+
+**Exception: no `vk-ref` equivalent.** For a capability `vk-ref` cannot run
+(for example a context above the reference's supported range), the unchanged
+control and the metric must be defined in a committed document before any
+measurement, and R1, R2, R4 (against that control) and R5 still apply.
+
+**Status today.** R3 fails everywhere. In P3, Rosevine decode was
+0.24–0.38 × `vk-ref` and prefill 0.05–0.15 ×; after K3, decode is still about
+0.67–0.69 × (unpaired). The candidates most likely to move a cell toward R3:
+- prefill expert offload (rv-e05-7n3.8) and the batched CPU expert kernel
+  (rv-e05-7n3.9) for prefill;
+- device routing (parity-plan G4) and the remaining decode overheads for
+  decode;
+- MTP (S2) with row- and group-shared verification attention (rv-e07-ktl.4)
+  for MTP decode.
+All are deferred until activated.

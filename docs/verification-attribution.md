@@ -96,4 +96,5 @@ under its own placement.
 | 2 | **Batched CPU expert kernel** (existing deferred bead rv-e05-7n3.9) | CPU experts 30.8 of 64.9 ms at d1900 width 4, linear in rows | Bounded by about 22 ms per width-4 verification. Gains only where rows share experts or decode amortizes. | That bead's threshold: less than 1.5× CPU-expert time |
 | 3 | Fewer host-expert layers for verification (placement) | Same linear CPU cost | Depends on VRAM; first-N = 2 more than doubled prefill (K1) | Needs an ADR 0002 decision; not a kernel candidate |
 
-None of these is activated. MTP implementation (S2) remains a separate decision.
+Rank 1 is tracked as rv-e07-ktl.4 (deferred). None of these is activated. MTP
+implementation (S2) remains a separate decision.
