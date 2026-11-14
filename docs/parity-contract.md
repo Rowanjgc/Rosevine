@@ -157,7 +157,11 @@ rosevine-inspect replay MODEL --backend hip --n-prompt P --n-decode D --reps R -
   --cpu-moe 10 --threads T < TOKENS
 ```
 
-`CPU_MOE` uses the same per-layer expert pattern as `--n-cpu-moe` at the pin.
+`CPU_MOE` uses the same per-layer expert pattern as `--n-cpu-moe` at the pin. It is
+either a count `N` (layers `0..N-1`) or an explicit list `L:a,b,c` for
+noncontiguous static placement controls. The adapter rejects duplicate or empty
+entries and layers outside the model. Its config row reports the loader's own
+override notices (`override_layers`, `override_tensors`) as a placement readback.
 `--run` and the Rosevine command load weights. Run them only under
 `gpu_campaign` supervision, inside a reviewed run window.
 
