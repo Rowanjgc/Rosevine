@@ -67,6 +67,15 @@ written reason; content changes invalidate them. They cannot exempt credentials,
 private keys, forbidden paths or binaries. Gitleaks findings need investigation,
 not automatic suppression. Broader policy changes need explicit human review.
 
+One commit-message exception exists, approved by the maintainer on 2026-11-14.
+Dependabot ends every commit message with a `Signed-off-by: dependabot[bot]` line
+carrying GitHub's public support address. Because the history scan covers every
+fetched branch, one open Dependabot PR otherwise fails CI for all branches. The
+history scan removes that exact line, and nothing else, from messages whose author
+is Dependabot's public noreply identity. A changed line, any other address or any
+other author is still rejected. Author metadata can be forged, but the exemption
+only ever admits that one public address.
+
 Hooks can be bypassed by configuration, command flags, another clone or changing
 the hook/tool itself. CI and remote protection provide independent layers; none
 prove publication is safe. Regexes miss novel, encoded or context-dependent private

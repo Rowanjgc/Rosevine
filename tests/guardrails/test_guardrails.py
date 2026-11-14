@@ -143,6 +143,40 @@ class HookTests(unittest.TestCase):
         self.assertIn(b'public email', result.stderr)
         self.assertNotIn(email.encode(), result.stdout + result.stderr)
 
+    def dependabot_commit(self, author, message):
+        self.commits = getattr(self, 'commits', 0) + 1
+        self.stage('sample.py', 'print(%d)\n' % self.commits)
+        # Hooks bypassed ONLY in this throwaway synthetic repository: the pre-commit
+        # identity check is not what is under test here.
+        result = self.git('-c', 'core.hooksPath=/dev/null', '-c', 'user.name=dependabot[bot]',
+                          '-c', 'user.email=' + author, 'commit', '-m', message)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        return subprocess.run(['/usr/bin/python3', 'scripts/guardrails.py', 'history'],
+                              cwd=self.repo, env=self.env, capture_output=True)
+
+    def test_dependabot_signoff_exception_is_narrow(self):
+        bot = '49699333+dependabot[bot]' + '@users.noreply.github.com'
+        signoff = 'Signed-off-by: dependabot[bot] <support' + '@github.com>'
+        body = 'Bump synthetic/action from 1.0.0 to 2.0.0\n\n---\nupdated-dependencies:\n...\n\n'
+        with self.subTest('exact line from the Dependabot author is accepted'):
+            result = self.dependabot_commit(bot, body + signoff)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+        accepted = self.git('rev-parse', 'HEAD').stdout.strip().decode()
+        cases = {
+            'same line from another author': ('tester@example.com', body + signoff),
+            'other address from the Dependabot author': (bot, body + 'Contact: synthetic@' + 'private.invalid'),
+            'altered sign-off line': (bot, body + signoff + ' extra'),
+            'address elsewhere in the message': (bot, 'See <support' + '@github.com>\n\n' + signoff),
+        }
+        for name, (author, message) in cases.items():
+            with self.subTest(name):
+                result = self.dependabot_commit(author, message)
+                # History scans branch refs only, so resetting removes the rejected commit.
+                self.git('reset', '-q', '--hard', accepted)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b'personal-email', result.stderr)
+                self.assertNotIn(b'private.invalid', result.stdout + result.stderr)
+
 
 class QualityTests(unittest.TestCase):
     def test_bad_link_and_malformed_adr(self):

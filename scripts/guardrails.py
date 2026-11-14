@@ -27,6 +27,14 @@ PATTERNS = {
     'credential-assignment': r'(?i)\b(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*["\']?[A-Za-z0-9_+/=-]{12,}',
 }
 
+# The single commit-message exception. GitHub's Dependabot appends this exact line,
+# with GitHub's public support address, to every commit it makes. It is removed only
+# from messages of commits whose author is Dependabot's public noreply identity; every
+# other line of those messages, and every other commit, is scanned unchanged.
+DEPENDABOT_AUTHOR = b'49699333+dependabot[bot]@users.noreply.github.com'
+# Split so this file does not itself contain a scannable address.
+DEPENDABOT_SIGNOFF = b'Signed-off-by: dependabot[bot] <support' + b'@github.com>'
+
 
 class Violation(Exception):
     pass
@@ -134,7 +142,14 @@ def history(refs=None):
     for commit in commits:
         scan(tree(commit))
         # Messages are public too. Author identities require a separate human review.
-        scan([('commit-message', git('show', '-s', '--format=%B', commit), '100644')])
+        scan([('commit-message', commit_message(commit), '100644')])
+
+
+def commit_message(commit):
+    author, message = git('show', '-s', '--format=%ae%x00%B', commit).split(b'\0', 1)
+    if author != DEPENDABOT_AUTHOR:
+        return message
+    return b'\n'.join(line for line in message.split(b'\n') if line != DEPENDABOT_SIGNOFF)
 
 
 def main():
