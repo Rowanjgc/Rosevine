@@ -90,10 +90,14 @@ kind of numerical drift as a placement change.
 
 ## Findings
 
-1. **At equal VRAM, static placement beats the cache for decode.**
+1. **At equal VRAM in this short-session cell (P = 512, 2 × 128 decode tokens),
+   static placement beats the cache for decode.**
    - The 2 GiB cache uses exactly the VRAM of 5 more GPU-resident layers.
    - It decodes 6% slower than layers 0–4 on the CPU with no cache (72.7
-     against 77.3 tok/s), even fully warm.
+     against 77.3 tok/s), even in the warm repetition.
+   - This depends on the session. At P = 2048 the measured cache step (13.0 ms)
+     beats the modeled equal-memory static step (about 14.1 ms). The
+     steady-state bounds are in [cache benefit bounds](cache-benefit-bounds.md).
    - Hit-driven uploads (37.5 MiB per token, about 1.3 ms at the measured
      28 GB/s) plus 10 synchronous ID readbacks per token cost more than they save.
 2. **An undersized cache is a net loss.**
@@ -121,10 +125,8 @@ kind of numerical drift as a placement change.
 
 For Rosevine, which executes host experts on the CPU at the same 0.82 ms per
 layer as llama.cpp (see [placement economics](placement-economics.md)), the
-measured cache does not justify a dynamic cache for decode at equal memory.
-`rv-e06-k0i.3` (cache benefit bounds and overlap) should start from this
-baseline: a static layout with N reduced by the cache's VRAM, plus the
-prefill-only benefit.
+comparison baseline is a static layout with N reduced by the cache's VRAM.
+[Cache benefit bounds](cache-benefit-bounds.md) (M3) carries this forward.
 
 ## Limits
 
