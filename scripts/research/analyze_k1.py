@@ -101,6 +101,8 @@ def parse_out(text):
 
 
 def load(case):
+    if not (case / 'run-summary.json').exists():
+        return {'failed': 'no run summary (running or interrupted)'}
     summary = json.loads((case / 'run-summary.json').read_text())
     if summary['status'] != 'successful':
         return {'failed': summary.get('reason') or summary['status']}
