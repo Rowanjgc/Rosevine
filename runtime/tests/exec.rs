@@ -495,6 +495,9 @@ mod hip_synthetic {
             // Per-span placement of the blocking calls.
             for il in 0..PATTERN_HIP.len() {
                 assert_eq!(i.stat(Span::Router, il).c.d2h, ev);
+                // KV store and attention kernel only: the depth-dependent attention work.
+                assert_eq!(i.stat(Span::AttnCore, il).c.launches, 2 * ev);
+                assert_eq!(i.stat(Span::AttnCore, il).c.blocking(), 0);
                 if s.host_expert_layer(il) {
                     assert_eq!(i.stat(Span::ExpIn, il).c.d2h, ev);
                     assert_eq!(i.stat(Span::ExpOut, il).c.h2d, ev);

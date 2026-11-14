@@ -10,6 +10,7 @@
 //! rosevine-inspect generate <gguf> --n <steps> [--batch B] [--threads T] [--ctx C] [--instr host|sync|events]
 //!                                                     # stdin: prompt token ids
 //! rosevine-inspect replay   <gguf> --n-prompt P --n-decode D [--reps R] [--batch B] [--threads T] [--ctx C]
+//!                           [--instr MODE] [--instr-prefill MODE] [--instr-per-layer]
 //!                                                     # stdin: P + D frozen token ids (parity P1)
 //! ```
 //!
@@ -243,42 +244,68 @@ impl<'w, 'a> Exec<'w, 'a> {
     }
 
     /// `--instr host|sync|events` (HIP only): instrument the decode steps that follow (R3a.1).
+    /// Without `--instr`, any earlier (prefill) instrumentation is switched off.
     fn instrument(&mut self, args: &[String]) -> Result<(), Error> {
+        self.reset_expert_stats();
+        self.instrument_with(args, "--instr")
+    }
+
+    fn reset_expert_stats(&mut self) {
         match self {
             Self::Cpu(s) => s.reset_expert_stats(),
             #[cfg(feature = "hip")]
             Self::Hip(s) => s.reset_expert_stats(),
         }
-        let Some(m) = opt::<String>(args, "--instr") else { return Ok(()) };
-        let mode = rosevine_runtime::instr::Mode::parse(&m).ok_or(Error::UnsupportedInput("unknown --instr mode"))?;
-        match self {
-            Exec::Cpu(_) => {
-                let _ = mode;
-                Err(Error::UnsupportedInput("--instr needs --backend hip"))
+    }
+
+    /// Enable the instrumentation mode named by option `name`, or disable instrumentation when the
+    /// option is absent. Re-enabling discards earlier measurements.
+    fn instrument_with(&mut self, args: &[String], name: &str) -> Result<(), Error> {
+        let mode = match opt::<String>(args, name) {
+            Some(m) => {
+                Some(rosevine_runtime::instr::Mode::parse(&m).ok_or(Error::UnsupportedInput("unknown --instr mode"))?)
             }
+            None => None,
+        };
+        match self {
+            Exec::Cpu(_) if mode.is_some() => Err(Error::UnsupportedInput("--instr needs --backend hip")),
+            Exec::Cpu(_) => Ok(()),
             #[cfg(feature = "hip")]
-            Exec::Hip(s) => s.set_instrumentation(Some(mode)),
+            Exec::Hip(s) => s.set_instrumentation(mode),
         }
     }
 
-    /// Print the instrumentation summary (timings and counts only) to stderr.
-    fn report_instrumentation(&self, loop_s: f64) {
+    /// Print the decode instrumentation summary (timings and counts only) to stderr.
+    fn report_instrumentation(&self, loop_s: f64, args: &[String]) {
+        self.report_phase("decode", loop_s, None, args);
+    }
+
+    /// Print one phase's summary to stderr. The decode header keeps the R3a.1 format; other phases
+    /// print `phase=<name> tokens=<n>` so a reducer can normalize per token. `--instr-per-layer`
+    /// adds the per-layer table.
+    fn report_phase(&self, phase: &str, loop_s: f64, tokens: Option<usize>, args: &[String]) {
         let stats = match self {
             Self::Cpu(s) => s.expert_stats(),
             #[cfg(feature = "hip")]
             Self::Hip(s) => s.expert_stats(),
         };
+        let _ = (phase, tokens, args);
         eprintln!("cpu_expert_rows={} scalar_fallback_rows={}", stats.rows, stats.scalar_fallbacks);
         #[cfg(feature = "hip")]
         if let Exec::Hip(s) = self {
             if let Some(i) = s.instrumentation() {
                 let group = |l: usize| if s.host_expert_layer(l) { "host" } else { "gpu" };
-                eprintln!(
-                    "decode_loop_ms={:.3} loop_closure={:.4}",
-                    loop_s * 1e3,
-                    i.total().host_ns as f64 / 1e9 / loop_s
-                );
+                let closure = i.total().host_ns as f64 / 1e9 / loop_s;
+                match tokens {
+                    None => eprintln!("decode_loop_ms={:.3} loop_closure={closure:.4}", loop_s * 1e3),
+                    Some(n) => {
+                        eprintln!("phase={phase} tokens={n} loop_ms={:.3} loop_closure={closure:.4}", loop_s * 1e3)
+                    }
+                }
                 eprint!("{}", i.summary(&group));
+                if args.iter().any(|a| a == "--instr-per-layer") {
+                    eprint!("{}", i.per_layer());
+                }
             }
         }
         let _ = loop_s;
@@ -489,7 +516,7 @@ fn generate(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error
         ids.push(next);
     }
     let dec = t1.elapsed().as_secs_f64();
-    sess.report_instrumentation(dec);
+    sess.report_instrumentation(dec, args);
     writeln!(out, "generated {}", ids_str(&ids)).ok();
     writeln!(
         out,
@@ -544,6 +571,9 @@ fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> 
     let never = || false;
     for rep in 0..reps {
         sess.reset();
+        // `--instr-prefill MODE` instruments this repetition's prefill microbatches (K1).
+        sess.reset_expert_stats();
+        sess.instrument_with(args, "--instr-prefill")?;
         let t0 = Instant::now();
         let chunks = toks[..n_prompt].chunks(batch).count();
         let (mut prefill_ns, mut prefill_top1) = (0, 0);
@@ -554,6 +584,9 @@ fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> 
                 prefill_ns = t0.elapsed().as_nanos();
                 prefill_top1 = argmax(lg);
             }
+        }
+        if opt::<String>(args, "--instr-prefill").is_some() {
+            sess.report_phase("prefill", prefill_ns as f64 / 1e9, Some(n_prompt), args);
         }
         sess.instrument(args)?;
         let mut steps = Vec::with_capacity(n_decode);
@@ -567,7 +600,7 @@ fn replay(args: &[String], g: &Gguf, out: &mut impl Write) -> Result<(), Error> 
             // Correctness record only; computed after the timed span closes.
             top1.push(argmax(lg).to_string());
         }
-        sess.report_instrumentation(t1.elapsed().as_secs_f64());
+        sess.report_instrumentation(t1.elapsed().as_secs_f64(), args);
         writeln!(
             out,
             "{{\"schema\":\"rosevine-parity-replay-v1\",\"kind\":\"rep\",\"rep\":{rep},\
