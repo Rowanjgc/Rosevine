@@ -10,6 +10,7 @@
 //
 // --validate-only TOKENS N_PROMPT N_DECODE checks the input without loading a backend.
 // --run MODEL TOKENS N_PROMPT N_DECODE REPS CTX BATCH UBATCH THREADS CPU_MOE KV FA REPACK
+// CPU_MOE: a layer count N (layers 0..N-1) or an explicit list L:a,b,c
 // loads weights and MUST be externally supervised in a reviewed run window.
 // Output: one JSON config line, then one JSON line per repetition (stdout).
 #include "llama.h"
@@ -23,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -30,12 +32,21 @@
 namespace {
 std::vector<std::string> g_buffer_lines;
 
+std::set<long> g_override_layers;
+long g_override_tensors = 0;
+
 void log_callback(ggml_log_level level, const char * text, void *) {
     // Keep only allocation summaries (no paths); everything else is discarded.
     if (text && std::strstr(text, "buffer size") && g_buffer_lines.size() < 256) {
         std::string line(text);
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
         g_buffer_lines.push_back(line);
+    }
+    // Placement readback: the loader's per-tensor override notices name the layer.
+    long layer = -1;
+    if (text && std::strstr(text, "buffer type overridden to") && std::sscanf(text, "tensor blk.%ld.", &layer) == 1) {
+        g_override_layers.insert(layer);
+        ++g_override_tensors;
     }
     if (level == GGML_LOG_LEVEL_ERROR) fputs("native error (detail withheld)\n", stderr);
 }
@@ -139,7 +150,29 @@ void run(char ** a) {
     const long n_batch = parse_count(a[6], 1, 1 << 16);
     const long n_ubatch = parse_count(a[7], 1, n_batch);
     const long threads = parse_count(a[8], 1, 256);
-    const long cpu_moe = parse_count(a[9], 0, 1024);
+    // CPU_MOE is either a count N (layers 0..N-1, as --n-cpu-moe) or an explicit
+    // layer list "L:a,b,c" for noncontiguous static placement controls.
+    std::vector<long> cpu_layers;
+    const std::string cpu_arg = a[9];
+    if (cpu_arg.rfind("L:", 0) == 0) {
+        std::string item;
+        for (size_t i = 2; i <= cpu_arg.size(); ++i) {
+            if (i == cpu_arg.size() || cpu_arg[i] == ',') {
+                if (item.empty()) throw std::runtime_error("empty CPU expert layer entry");
+                const long l = parse_count(item.c_str(), 0, 1023);
+                for (const long seen : cpu_layers) {
+                    if (seen == l) throw std::runtime_error("duplicate CPU expert layer");
+                }
+                cpu_layers.push_back(l);
+                item.clear();
+            } else {
+                item += cpu_arg[i];
+            }
+        }
+    } else {
+        for (long l = 0, n = parse_count(a[9], 0, 1024); l < n; ++l) cpu_layers.push_back(l);
+    }
+    const long cpu_moe = static_cast<long>(cpu_layers.size());
     const std::string kv = a[10], fa = a[11], repack = a[12];
     if ((kv != "q8_0" && kv != "f16") || (fa != "on" && fa != "off") || (repack != "on" && repack != "off")) {
         throw std::runtime_error("kv must be q8_0|f16, fa on|off, repack on|off");
@@ -149,9 +182,11 @@ void run(char ** a) {
     // Same per-layer pattern as common's --n-cpu-moe at this pin (LLM_FFN_EXPS_REGEX).
     std::vector<std::string> patterns;
     std::vector<llama_model_tensor_buft_override> overrides;
-    for (long l = 0; l < cpu_moe; ++l) {
+    for (const long l : cpu_layers) {
         patterns.push_back("blk\\." + std::to_string(l) + "\\.ffn_(up|down|gate|gate_up)_(ch|)exps");
     }
+    std::string layer_list;
+    for (size_t i = 0; i < cpu_layers.size(); ++i) layer_list += (i ? "," : "") + std::to_string(cpu_layers[i]);
     for (const auto & p : patterns) overrides.push_back({p.c_str(), ggml_backend_cpu_buffer_type()});
     overrides.push_back({nullptr, nullptr});
     auto mp = llama_model_default_params();
@@ -165,6 +200,9 @@ void run(char ** a) {
     std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
         llama_model_load_from_file(model_path, mp), llama_model_free);
     if (!model) throw std::runtime_error("model load failed");
+    for (const long l : cpu_layers) {
+        if (l >= llama_model_n_layer(model.get())) throw std::runtime_error("CPU expert layer outside the model");
+    }
     auto cp = llama_context_default_params();
     cp.n_ctx = static_cast<uint32_t>(n_ctx);
     cp.n_batch = static_cast<uint32_t>(n_batch);
@@ -183,17 +221,19 @@ void run(char ** a) {
     for (const auto t : toks) {
         if (t >= llama_vocab_n_tokens(vocab)) throw std::runtime_error("token outside vocabulary");
     }
+    std::string override_list;
+    for (const long l : g_override_layers) override_list += (override_list.empty() ? "" : ",") + std::to_string(l);
     std::string buffers;
     for (size_t i = 0; i < g_buffer_lines.size(); ++i) {
         buffers += (i ? ",\"" : "\"") + json_escape(g_buffer_lines[i]) + "\"";
     }
     printf("{\"schema\":\"rosevine-parity-replay-v1\",\"kind\":\"config\",\"engine\":\"llama.cpp\","
            "\"n_prompt\":%ld,\"n_decode\":%ld,\"reps\":%ld,\"n_ctx\":%u,\"n_batch\":%u,\"n_ubatch\":%u,"
-           "\"threads\":%ld,\"cpu_moe_layers\":%ld,\"kv_type\":\"%s\",\"flash_attn\":\"%s\","
+           "\"threads\":%ld,\"cpu_moe_layers\":%ld,\"cpu_moe_layer_list\":\"%s\",\"override_layers\":\"%s\",\"override_tensors\":%ld,\"kv_type\":\"%s\",\"flash_attn\":\"%s\","
            "\"cpu_repack\":\"%s\",\"cpu_expert_activation\":\"q8_0\",\"swa_full\":%s,\"op_offload\":%s,"
            "\"tokens_fnv1a64\":\"%016llx\",\"buffers\":[%s]}\n",
            n_prompt, n_decode, reps, llama_n_ctx(ctx), llama_n_batch(ctx), llama_n_ubatch(ctx), threads,
-           cpu_moe, kv.c_str(), fa.c_str(), repack.c_str(), cp.swa_full ? "true" : "false",
+           cpu_moe, layer_list.c_str(), override_list.c_str(), g_override_tensors, kv.c_str(), fa.c_str(), repack.c_str(), cp.swa_full ? "true" : "false",
            cp.op_offload ? "true" : "false", static_cast<unsigned long long>(fnv1a64(toks)), buffers.c_str());
     fflush(stdout);
     for (long r = 0; r < reps; ++r) {
